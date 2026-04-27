@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ruff_cache/
+.mypy_cache/
+
+# MkDocs build output
+site/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local agent state — should never be committed
+.agent-aws/

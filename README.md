@@ -4,6 +4,8 @@ Lets a developer hand an agent **read-only** access to AWS, even when the
 developer themselves has both Administrator and ReadOnly roles assigned via
 IAM Identity Center.
 
+📖 **Full documentation:** <https://juanheyns.github.io/agent-aws/>
+
 ## Threat model
 
 The threat is *not* the developer — they already have admin. The threat is
@@ -135,10 +137,23 @@ A brew formula is the intended distribution path; not yet built.
 
 ## Roadmap
 
+See [docs/roadmap.md](docs/roadmap.md) for the full list. Short version:
+
 * Long-running broker daemon so `credential_process` can refresh STS creds
   inside the sandbox without the wrapper holding the SSO token in memory.
 * Tighter sandbox profile (deny default + explicit allows for
   `process-exec`).
 * SCP / permission-boundary template that denies destructive actions for
   sessions tagged `agent=true`, as the AWS-side backstop.
-* Brew formula.
+* `agent-gh` and other shims following the same pattern.
+
+## Releasing
+
+Tag-driven via GitHub Actions; pushes a Homebrew formula to
+[`juanheyns/homebrew-tap`](https://github.com/juanheyns/homebrew-tap). See
+[docs/releasing.md](docs/releasing.md) for the one-time `HOMEBREW_TAP_TOKEN`
+secret setup.
+
+## License
+
+[MIT](LICENSE).

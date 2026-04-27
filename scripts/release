@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""release — bump version (major/minor/patch), commit, tag.
+
+Usage:
+  scripts/release patch        # 0.1.0 -> 0.1.1
+  scripts/release minor        # 0.1.0 -> 0.2.0
+  scripts/release major        # 0.1.0 -> 1.0.0
+  scripts/release 1.2.3        # explicit version
+
+By default the script:
+  1. Verifies the working tree is clean and you're on main.
+  2. Verifies pyproject.toml and bin/agent-aws currently agree on version.
+  3. Bumps both files to the new version.
+  4. Commits with message "release vX.Y.Z".
+  5. Creates an annotated tag vX.Y.Z.
+  6. Prints the push command. Pass --push to also push automatically.
+
+Once the tag is pushed, the release.yml workflow renders the Homebrew
+formula and pushes it to juanheyns/homebrew-tap.
+"""
+
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PYPROJECT = ROOT / "pyproject.toml"
+AGENT_AWS = ROOT / "bin" / "agent-aws"
+
+
+def die(msg, code=1):
+    print(f"release: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(*args, capture=False):
+    r = subprocess.run(args, cwd=ROOT, capture_output=capture, text=True)
+    if r.returncode != 0:
+        if capture and r.stderr:
+            sys.stderr.write(r.stderr)
+        die(f"command failed: {' '.join(args)}")
+    return r.stdout.strip() if capture else None
+
+
+def read_pyproject_version():
+    m = re.search(r'^version\s*=\s*"([^"]+)"', PYPROJECT.read_text(), re.M)
+    if not m:
+        die("pyproject.toml has no [project].version")
+    return m.group(1)
+
+
+def read_script_version():
+    m = re.search(r'^__version__\s*=\s*"([^"]+)"', AGENT_AWS.read_text(), re.M)
+    if not m:
+        die("bin/agent-aws has no __version__")
+    return m.group(1)
+
+
+def parse_semver(v):
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)$", v)
+    if not m:
+        die(f"unparseable version '{v}' (expected MAJOR.MINOR.PATCH)")
+    return tuple(int(x) for x in m.groups())
+
+
+def compute_next(current, kind):
+    if kind in ("major", "minor", "patch"):
+        major, minor, patch = parse_semver(current)
+        if kind == "major":
+            return f"{major + 1}.0.0"
+        if kind == "minor":
+            return f"{major}.{minor + 1}.0"
+        return f"{major}.{minor}.{patch + 1}"
+    parse_semver(kind)  # explicit version — validate format
+    return kind
+
+
+def replace_in_file(path, pattern, replacement):
+    text = path.read_text()
+    new_text, n = re.subn(pattern, replacement, text, flags=re.M)
+    if n != 1:
+        die(f"version pattern matched {n} times in {path}, expected 1")
+    path.write_text(new_text)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("bump", help="major | minor | patch | X.Y.Z")
+    p.add_argument("-n", "--dry-run", action="store_true",
+                   help="show what would happen without writing or committing")
+    p.add_argument("--push", action="store_true",
+                   help="also push the commit and tag to origin")
+    p.add_argument("--allow-dirty", action="store_true",
+                   help="skip the clean-working-tree check")
+    p.add_argument("--allow-branch", action="store_true",
+                   help="skip the on-main-branch check")
+    args = p.parse_args()
+
+    branch = run("git", "branch", "--show-current", capture=True)
+    if branch != "main" and not args.allow_branch:
+        die(f"on branch '{branch}', expected 'main' (use --allow-branch to override)")
+
+    if not args.allow_dirty:
+        unstaged = subprocess.run(["git", "diff", "--quiet"], cwd=ROOT).returncode
+        staged = subprocess.run(["git", "diff", "--staged", "--quiet"], cwd=ROOT).returncode
+        if unstaged or staged:
+            die("working tree not clean (--allow-dirty to override)")
+
+    py_v = read_pyproject_version()
+    sc_v = read_script_version()
+    if py_v != sc_v:
+        die(f"versions disagree already: pyproject={py_v} script={sc_v}")
+
+    new_v = compute_next(py_v, args.bump)
+    if new_v == py_v:
+        die(f"new version {new_v} is the same as current")
+
+    tag = f"v{new_v}"
+    if subprocess.run(["git", "rev-parse", "--verify", "--quiet", tag],
+                      cwd=ROOT, capture_output=True).returncode == 0:
+        die(f"tag {tag} already exists")
+
+    print(f"release: {py_v} -> {new_v}  (tag: {tag})")
+
+    if args.dry_run:
+        print(f"[dry-run] would update pyproject.toml -> version = \"{new_v}\"")
+        print(f"[dry-run] would update bin/agent-aws  -> __version__ = \"{new_v}\"")
+        print(f"[dry-run] would: git commit -m 'release {tag}'")
+        print(f"[dry-run] would: git tag -a {tag} -m 'agent-aws {tag}'")
+        if args.push:
+            print(f"[dry-run] would: git push origin {branch} {tag}")
+        return
+
+    replace_in_file(PYPROJECT,
+                    r'^version\s*=\s*"[^"]+"',
+                    f'version = "{new_v}"')
+    replace_in_file(AGENT_AWS,
+                    r'^__version__\s*=\s*"[^"]+"',
+                    f'__version__ = "{new_v}"')
+
+    run("git", "add", "pyproject.toml", "bin/agent-aws")
+    run("git", "commit", "-m", f"release {tag}")
+    run("git", "tag", "-a", tag, "-m", f"agent-aws {tag}")
+
+    print(f"release: committed and tagged {tag}")
+
+    if args.push:
+        run("git", "push", "origin", branch)
+        run("git", "push", "origin", tag)
+        print(f"release: pushed {branch} and {tag} to origin")
+    else:
+        print()
+        print("To publish:")
+        print(f"  git push origin {branch} {tag}")
+        print()
+        print("Once the tag is pushed, the release workflow renders the")
+        print("Homebrew formula and pushes it to juanheyns/homebrew-tap.")
+
+
+if __name__ == "__main__":
+    main()

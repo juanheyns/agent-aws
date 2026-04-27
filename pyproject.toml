@@ -1,0 +1,24 @@
+[project]
+name = "agent-aws"
+version = "0.1.0"
+description = "Run CLI agents against AWS in a scoped read-only sandbox"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [{ name = "Juan Heyns" }]
+keywords = ["aws", "agent", "sandbox", "sso", "security", "claude"]
+
+[project.urls]
+Homepage = "https://github.com/juanheyns/agent-aws"
+Documentation = "https://juanheyns.github.io/agent-aws/"
+Source = "https://github.com/juanheyns/agent-aws"
+Issues = "https://github.com/juanheyns/agent-aws/issues"
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+extend-include = ["bin/agent-aws", "scripts/*"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]

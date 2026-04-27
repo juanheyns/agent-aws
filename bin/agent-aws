@@ -24,6 +24,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+__version__ = "0.1.0"
+
 HOME = Path.home()
 AWS_DIR = HOME / ".aws"
 AWS_CONFIG = AWS_DIR / "config"
@@ -33,7 +35,7 @@ AGENT_DIR = HOME / ".agent-aws"
 AGENT_CONFIG = AGENT_DIR / "config.json"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-SANDBOX_PROFILE = SCRIPT_DIR.parent / "share" / "agent-aws.sb"
+SANDBOX_PROFILE = SCRIPT_DIR.parent / "share" / "agent-aws" / "agent-aws.sb"
 
 ADMIN_BLOCKLIST = ("admin", "poweruser", "fullaccess")
 
@@ -376,10 +378,14 @@ def cmd_run(args):
         rc = subprocess.run(sandbox_argv + args.cmd, env=env).returncode
     finally:
         for p in (cred_file, cfg_file):
-            try: p.unlink()
-            except FileNotFoundError: pass
-        try: creds_dir.rmdir()
-        except OSError: pass
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            creds_dir.rmdir()
+        except OSError:
+            pass
     sys.exit(rc)
 
 
@@ -409,6 +415,7 @@ def main():
         prog="agent-aws",
         description="Run agents against AWS in a scoped read-only sandbox.",
     )
+    p.add_argument("--version", action="version", version=f"agent-aws {__version__}")
     sub = p.add_subparsers(dest="sub", required=True)
 
     p_init = sub.add_parser("init", help="bootstrap ~/.agent-aws/config.json from ~/.aws/config")

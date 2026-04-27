@@ -1,0 +1,130 @@
+name: Publish to Homebrew tap
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            tag="${{ github.event.release.tag_name }}"
+          else
+            tag="${{ inputs.tag }}"
+          fi
+          version="${tag#v}"
+          echo "tag=$tag"          >> "$GITHUB_OUTPUT"
+          echo "version=$version"  >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Verify tag matches pyproject + script versions
+        run: |
+          python - <<PY
+          import re, sys, tomllib
+          tag_version = "${{ steps.tag.outputs.version }}"
+          with open("pyproject.toml", "rb") as f:
+              pyproject_version = tomllib.load(f)["project"]["version"]
+          m = re.search(r'^__version__\s*=\s*"([^"]+)"', open("bin/agent-aws").read(), re.M)
+          script_version = m.group(1) if m else None
+          mismatches = []
+          if pyproject_version != tag_version:
+              mismatches.append(f"pyproject={pyproject_version} != tag={tag_version}")
+          if script_version != tag_version:
+              mismatches.append(f"script={script_version} != tag={tag_version}")
+          if mismatches:
+              sys.exit("Refusing to publish: " + "; ".join(mismatches) +
+                       ". Bump bin/agent-aws __version__ and pyproject.toml [project].version "
+                       "to match the tag before releasing.")
+          print(f"ok: {tag_version}")
+          PY
+
+      - name: Compute tarball sha256
+        id: tarball
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          url="https://github.com/${{ github.repository }}/archive/refs/tags/${tag}.tar.gz"
+          sha=$(curl -fsSL "$url" | sha256sum | awk '{print $1}')
+          if [ -z "$sha" ] || [ "$sha" = "-" ]; then
+            echo "failed to fetch or hash tarball at $url" >&2
+            exit 1
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Render formula
+        run: |
+          mkdir -p out
+          cat > out/agent-aws.rb <<EOF
+          class AgentAws < Formula
+            desc "Run CLI agents against AWS in a scoped read-only sandbox"
+            homepage "https://github.com/${{ github.repository }}"
+            url "${{ steps.tarball.outputs.url }}"
+            version "${{ steps.tag.outputs.version }}"
+            sha256 "${{ steps.tarball.outputs.sha }}"
+            license "MIT"
+
+            uses_from_macos "python"
+
+            def install
+              bin.install "bin/agent-aws"
+              pkgshare.install "share/agent-aws/agent-aws.sb"
+            end
+
+            def caveats
+              on_linux do
+                <<~CAVEATS
+                  Linux requires bubblewrap, installed via your distro's package manager:
+                    apt install bubblewrap     # Debian / Ubuntu
+                    dnf install bubblewrap     # Fedora / RHEL
+                    pacman -S bubblewrap       # Arch
+                CAVEATS
+              end
+            end
+
+            test do
+              system bin/"agent-aws", "--help"
+            end
+          end
+          EOF
+          echo "--- rendered formula ---"
+          cat out/agent-aws.rb
+
+      - name: Push to homebrew-tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN secret is not set; aborting." >&2
+            echo "See docs/releasing.md for setup steps." >&2
+            exit 1
+          fi
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/juanheyns/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp out/agent-aws.rb tap/Formula/agent-aws.rb
+          cd tap
+          git config user.email "actions@github.com"
+          git config user.name  "GitHub Actions"
+          git add Formula/agent-aws.rb
+          if git diff --staged --quiet; then
+            echo "Formula unchanged; nothing to commit."
+            exit 0
+          fi
+          git commit -m "agent-aws ${{ steps.tag.outputs.tag }}"
+          git push

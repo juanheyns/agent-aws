@@ -1,0 +1,60 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: ruff check
+        run: ruff check
+
+      - name: Syntax check (py_compile)
+        run: python -m py_compile bin/agent-aws
+
+      - name: Version consistency (pyproject.toml ↔ bin/agent-aws)
+        run: |
+          python - <<'PY'
+          import re
+          import sys
+          import tomllib
+          with open("pyproject.toml", "rb") as f:
+              pyproject_version = tomllib.load(f)["project"]["version"]
+          script = open("bin/agent-aws").read()
+          m = re.search(r'^__version__\s*=\s*"([^"]+)"', script, re.M)
+          if not m:
+              sys.exit("bin/agent-aws missing __version__ constant")
+          script_version = m.group(1)
+          if pyproject_version != script_version:
+              sys.exit(
+                  f"version mismatch: pyproject={pyproject_version} script={script_version}"
+              )
+          print(f"ok: {pyproject_version}")
+          PY
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install MkDocs Material
+        run: pip install "mkdocs-material>=9"
+
+      - name: Build docs (strict)
+        run: mkdocs build --strict

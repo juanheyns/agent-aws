@@ -1,0 +1,54 @@
+site_name: agent-aws
+site_description: Run CLI agents against AWS in a scoped read-only sandbox.
+site_url: https://juanheyns.github.io/agent-aws/
+repo_url: https://github.com/juanheyns/agent-aws
+repo_name: juanheyns/agent-aws
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - content.code.copy
+    - content.action.edit
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Threat model: threat-model.md
+  - Configuration: configuration.md
+  - Platform support: platform-support.md
+  - Releasing: releasing.md
+  - Roadmap: roadmap.md
