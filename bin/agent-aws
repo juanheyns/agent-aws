@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""agent-aws — run CLI agents against AWS with scoped read-only roles.
+
+Layered design:
+  1. agent-aws init bootstraps ~/.agent-aws/config.json with one or more
+     read-only profiles selected from ~/.aws/config. Admin-equivalent role
+     names are rejected at init time.
+  2. agent-aws run mints short-lived STS creds for each configured profile,
+     writes them to a per-invocation tempdir, and execs the requested
+     command inside sandbox-exec. The sandbox denies file-read* on ~/.aws/,
+     so even if the wrapped process tries to mint admin creds from the SSO
+     cache, the read fails before any AWS API call can happen.
+"""
+
+import argparse
+import configparser
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+AWS_DIR = HOME / ".aws"
+AWS_CONFIG = AWS_DIR / "config"
+AWS_SSO_CACHE = AWS_DIR / "sso" / "cache"
+
+AGENT_DIR = HOME / ".agent-aws"
+AGENT_CONFIG = AGENT_DIR / "config.json"
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SANDBOX_PROFILE = SCRIPT_DIR.parent / "share" / "agent-aws.sb"
+
+ADMIN_BLOCKLIST = ("admin", "poweruser", "fullaccess")
+
+IS_MACOS = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
+
+
+def die(msg, code=1):
+    print(f"agent-aws: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def is_admin_role(role):
+    role_lower = (role or "").lower()
+    return any(b in role_lower for b in ADMIN_BLOCKLIST)
+
+
+def load_config():
+    if not AGENT_CONFIG.exists():
+        die(f"no config at {AGENT_CONFIG} — run `agent-aws init` first")
+    raw = json.loads(AGENT_CONFIG.read_text())
+    # In-memory migration: pre-multi-profile schema had account_id at the top
+    # level. Wrap it as a single profile named "default" so the rest of the
+    # code path is uniform. The on-disk file is rewritten on next `init`.
+    if "profiles" not in raw and "account_id" in raw:
+        raw = {"default_profile": "default", "profiles": {"default": raw}}
+    return raw
+
+
+def parse_aws_config():
+    if not AWS_CONFIG.exists():
+        die(f"~/.aws/config not found at {AWS_CONFIG}")
+    cp = configparser.ConfigParser()
+    cp.read(AWS_CONFIG)
+    profiles, sessions = {}, {}
+    for section in cp.sections():
+        if section.startswith("profile "):
+            profiles[section[len("profile "):]] = dict(cp[section])
+        elif section.startswith("sso-session "):
+            sessions[section[len("sso-session "):]] = dict(cp[section])
+    return profiles, sessions
+
+
+def find_sso_tokens():
+    """Return {startUrl: accessToken} for the freshest unexpired token per URL."""
+    if not AWS_SSO_CACHE.exists():
+        return {}
+    now = time.time()
+    best = {}
+    for p in AWS_SSO_CACHE.glob("*.json"):
+        try:
+            data = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        url = data.get("startUrl")
+        token = data.get("accessToken")
+        exp = data.get("expiresAt")
+        if not (url and token and exp):
+            continue
+        try:
+            exp_ts = datetime.fromisoformat(exp.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        if exp_ts < now:
+            continue
+        if url not in best or exp_ts > best[url][1]:
+            best[url] = (token, exp_ts)
+    return {url: tok for url, (tok, _) in best.items()}
+
+
+def derive_profile_entry(name, src, sessions):
+    sess_name = src.get("sso_session")
+    if not sess_name or sess_name not in sessions:
+        die(f"profile '{name}' has no usable sso_session")
+    sess = sessions[sess_name]
+    role = src.get("sso_role_name")
+    if is_admin_role(role):
+        die(f"refusing admin-equivalent role '{role}' for profile '{name}'")
+    return {
+        "sso_session": sess_name,
+        "sso_start_url": sess["sso_start_url"],
+        "sso_region": sess["sso_region"],
+        "account_id": src["sso_account_id"],
+        "role_name": role,
+        "default_region": src.get("region", sess["sso_region"]),
+    }
+
+
+def cmd_init(args):
+    profiles, sessions = parse_aws_config()
+    if not profiles:
+        die("no profiles found in ~/.aws/config")
+
+    eligible = {n: p for n, p in profiles.items()
+                if not is_admin_role(p.get("sso_role_name"))}
+    if not eligible:
+        die("no non-admin profiles in ~/.aws/config — add a ReadOnlyAccess profile")
+
+    if args.all:
+        chosen = list(eligible)
+    elif args.profile:
+        chosen = list(args.profile)
+        for n in chosen:
+            if n in profiles and n not in eligible:
+                die(f"refusing admin-equivalent profile '{n}'")
+            if n not in profiles:
+                die(f"profile '{n}' not found in ~/.aws/config")
+    else:
+        chosen = interactive_select(eligible)
+
+    new_profiles = {n: derive_profile_entry(n, eligible[n], sessions) for n in chosen}
+
+    if args.default:
+        if args.default not in new_profiles:
+            die(f"--default '{args.default}' not in selected profiles")
+        default = args.default
+    else:
+        default = chosen[0]
+        if len(chosen) > 1:
+            print(f"agent-aws: using '{default}' as default profile (override with --default)", file=sys.stderr)
+
+    cfg = {"default_profile": default, "profiles": new_profiles}
+    AGENT_DIR.mkdir(mode=0o700, exist_ok=True)
+    AGENT_CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+    AGENT_CONFIG.chmod(0o600)
+
+    print(f"wrote {AGENT_CONFIG}")
+    print(f"  default: {default}")
+    for n, p in new_profiles.items():
+        marker = "*" if n == default else " "
+        print(f"  {marker} {n}  ({p['role_name']} @ {p['account_id']})")
+
+
+def interactive_select(eligible):
+    print("Read-only profiles in ~/.aws/config:")
+    names = list(eligible)
+    for i, n in enumerate(names, 1):
+        p = eligible[n]
+        print(f"  {i}. {n}  ({p.get('sso_role_name')} @ {p.get('sso_account_id')})")
+    sel = input("Select (comma-separated numbers, or 'all'): ").strip()
+    if sel.lower() == "all":
+        return names
+    chosen = []
+    try:
+        for s in sel.split(","):
+            chosen.append(names[int(s.strip()) - 1])
+    except (ValueError, IndexError):
+        die("invalid selection")
+    if not chosen:
+        die("no profiles selected")
+    return chosen
+
+
+def cmd_login(args):
+    cfg = load_config()
+    sessions = sorted({p["sso_session"] for p in cfg["profiles"].values()})
+    if args.session:
+        if args.session not in sessions:
+            die(f"session '{args.session}' not used by any configured profile")
+        sessions = [args.session]
+    rc = 0
+    for s in sessions:
+        if len(sessions) > 1:
+            print(f"=== aws sso login --sso-session {s} ===")
+        r = subprocess.run(["aws", "sso", "login", "--sso-session", s])
+        if r.returncode != 0:
+            rc = r.returncode
+    sys.exit(rc)
+
+
+def mint_role_creds(token, profile_cfg):
+    r = subprocess.run(
+        [
+            "aws", "sso", "get-role-credentials",
+            "--role-name", profile_cfg["role_name"],
+            "--account-id", profile_cfg["account_id"],
+            "--access-token", token,
+            "--region", profile_cfg["sso_region"],
+            "--output", "json",
+        ],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        die(f"sso get-role-credentials failed for "
+            f"{profile_cfg['role_name']}@{profile_cfg['account_id']}: {r.stderr.strip()}")
+    return json.loads(r.stdout)["roleCredentials"]
+
+
+def default_path():
+    parts = ["/usr/local/bin", "/usr/bin", "/bin"]
+    if IS_MACOS:
+        parts.append("/opt/homebrew/bin")
+    if IS_LINUX:
+        parts.extend(["/usr/local/sbin", "/usr/sbin", str(HOME / ".local" / "bin")])
+    return ":".join(parts)
+
+
+def check_sandbox_tool():
+    if IS_MACOS:
+        if not shutil.which("sandbox-exec"):
+            die("sandbox-exec not found (should be built-in on macOS)")
+        if not SANDBOX_PROFILE.exists():
+            die(f"sandbox profile not found at {SANDBOX_PROFILE}")
+    elif IS_LINUX:
+        if not shutil.which("bwrap"):
+            die("bwrap not found — install bubblewrap "
+                "(apt install bubblewrap / dnf install bubblewrap / pacman -S bubblewrap)")
+    else:
+        die(f"unsupported platform: {sys.platform}")
+
+
+def build_sandbox_argv_darwin(creds_dir):
+    return [
+        "sandbox-exec",
+        "-D", f"HOME_AWS_DIR={AWS_DIR}",
+        "-D", f"AGENT_DIR={AGENT_DIR}",
+        "-f", str(SANDBOX_PROFILE),
+    ]
+
+
+def build_sandbox_argv_linux(creds_dir):
+    home = str(HOME)
+    return [
+        "bwrap",
+        # Read-only system mounts. -try variants don't fail if the path is
+        # absent (e.g. /lib64 on some distros, /sbin where it symlinks).
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/etc", "/etc",
+        "--ro-bind-try", "/bin", "/bin",
+        "--ro-bind-try", "/sbin", "/sbin",
+        "--ro-bind-try", "/lib", "/lib",
+        "--ro-bind-try", "/lib64", "/lib64",
+        "--ro-bind-try", "/opt", "/opt",
+        # Pseudo-filesystems
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        # Per-run creds dir (writable inside, same path inside as outside)
+        "--bind", str(creds_dir), str(creds_dir),
+        # Home dir, with credential dirs overlaid by empty tmpfs so the agent
+        # sees nothing in either ~/.aws or ~/.agent-aws — the sandbox mirror
+        # of the macOS profile's `(deny file-read* (subpath ...))` rules.
+        "--bind", home, home,
+        "--tmpfs", str(AWS_DIR),
+        "--tmpfs", str(AGENT_DIR),
+        # Hygiene + isolation
+        "--die-with-parent",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--new-session",
+        "--",
+    ]
+
+
+def build_sandbox_argv(creds_dir):
+    if IS_MACOS:
+        return build_sandbox_argv_darwin(creds_dir)
+    if IS_LINUX:
+        return build_sandbox_argv_linux(creds_dir)
+    die(f"unsupported platform: {sys.platform}")
+
+
+def cmd_run(args):
+    if not args.cmd:
+        die("usage: agent-aws run [--profile NAME] -- <command> [args...]")
+    check_sandbox_tool()
+
+    cfg = load_config()
+    profiles = cfg["profiles"]
+    if not profiles:
+        die("no profiles configured — run `agent-aws init`")
+
+    if args.profile:
+        if args.profile not in profiles:
+            die(f"profile '{args.profile}' not configured (run `agent-aws init`)")
+        active = {args.profile: profiles[args.profile]}
+        active_default = args.profile
+    else:
+        active = profiles
+        active_default = cfg.get("default_profile") or next(iter(profiles))
+
+    tokens = find_sso_tokens()
+    needed = {p["sso_start_url"] for p in active.values()}
+    missing = needed - set(tokens.keys())
+    if missing:
+        die(f"no valid SSO token for: {', '.join(sorted(missing))} — run `agent-aws login`")
+
+    creds_dir = Path(tempfile.mkdtemp(prefix="agent-aws.", dir="/tmp"))
+    creds_dir.chmod(0o700)
+    cred_file = creds_dir / "credentials"
+    cfg_file = creds_dir / "config"
+
+    cred_lines, cfg_lines = [], []
+    for name, p in active.items():
+        creds = mint_role_creds(tokens[p["sso_start_url"]], p)
+        sections = [name, "default"] if name == active_default else [name]
+        for sect in sections:
+            cred_lines += [
+                f"[{sect}]",
+                f"aws_access_key_id = {creds['accessKeyId']}",
+                f"aws_secret_access_key = {creds['secretAccessKey']}",
+                f"aws_session_token = {creds['sessionToken']}",
+                "",
+            ]
+            cfg_header = "default" if sect == "default" else f"profile {sect}"
+            cfg_lines += [
+                f"[{cfg_header}]",
+                f"region = {p['default_region']}",
+                "output = json",
+                "",
+            ]
+
+    cred_file.write_text("\n".join(cred_lines))
+    cfg_file.write_text("\n".join(cfg_lines))
+    cred_file.chmod(0o600)
+    cfg_file.chmod(0o600)
+
+    AGENT_DIR.mkdir(mode=0o700, exist_ok=True)
+
+    sandbox_argv = build_sandbox_argv(creds_dir)
+
+    env = {
+        "HOME": str(HOME),
+        "USER": os.environ.get("USER", ""),
+        "LOGNAME": os.environ.get("LOGNAME", ""),
+        "TERM": os.environ.get("TERM", "xterm-256color"),
+        "PATH": default_path(),
+        "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+        "AWS_CONFIG_FILE": str(cfg_file),
+        "AWS_SHARED_CREDENTIALS_FILE": str(cred_file),
+        "AWS_REGION": active[active_default]["default_region"],
+        "AWS_DEFAULT_REGION": active[active_default]["default_region"],
+        "AGENT_AWS_ACTIVE": "1",
+        "AGENT_AWS_PROFILES": ",".join(active.keys()),
+        "AGENT_AWS_DEFAULT_PROFILE": active_default,
+    }
+
+    try:
+        rc = subprocess.run(sandbox_argv + args.cmd, env=env).returncode
+    finally:
+        for p in (cred_file, cfg_file):
+            try: p.unlink()
+            except FileNotFoundError: pass
+        try: creds_dir.rmdir()
+        except OSError: pass
+    sys.exit(rc)
+
+
+def cmd_whoami(args):
+    args.cmd = ["aws", "sts", "get-caller-identity"]
+    cmd_run(args)
+
+
+def cmd_status(args):
+    cfg = load_config()
+    tokens = find_sso_tokens()
+    default = cfg.get("default_profile")
+    print(f"Config:  {AGENT_CONFIG}")
+    print(f"Default: {default}")
+    print()
+    name_w = max((len(n) for n in cfg["profiles"]), default=8)
+    print(f"  {'profile':<{name_w}}  {'account':<14}  {'role':<22}  sso")
+    print(f"  {'-'*name_w}  {'-'*14}  {'-'*22}  -------")
+    for n, p in cfg["profiles"].items():
+        sso_state = "ok" if p["sso_start_url"] in tokens else "expired"
+        marker = "*" if n == default else " "
+        print(f"{marker} {n:<{name_w}}  {p['account_id']:<14}  {p['role_name']:<22}  {sso_state}")
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="agent-aws",
+        description="Run agents against AWS in a scoped read-only sandbox.",
+    )
+    sub = p.add_subparsers(dest="sub", required=True)
+
+    p_init = sub.add_parser("init", help="bootstrap ~/.agent-aws/config.json from ~/.aws/config")
+    p_init.add_argument("--profile", action="append",
+                        help="source profile name (repeatable)")
+    p_init.add_argument("--all", action="store_true",
+                        help="include every non-admin profile in ~/.aws/config")
+    p_init.add_argument("--default", help="profile to mark as default")
+    p_init.set_defaults(func=cmd_init)
+
+    p_login = sub.add_parser("login", help="aws sso login for configured sessions")
+    p_login.add_argument("--session", help="log in to a specific sso-session only")
+    p_login.set_defaults(func=cmd_login)
+
+    p_run = sub.add_parser("run", help="run a command in the sandbox with read-only AWS creds")
+    p_run.add_argument("--profile", help="restrict to a single profile (default: expose all)")
+    p_run.add_argument("cmd", nargs=argparse.REMAINDER,
+                       help="command and args (use -- to separate)")
+    p_run.set_defaults(func=cmd_run)
+
+    p_whoami = sub.add_parser("whoami", help="run `aws sts get-caller-identity` in the sandbox")
+    p_whoami.add_argument("--profile", help="restrict to a single profile")
+    p_whoami.set_defaults(func=cmd_whoami)
+
+    p_status = sub.add_parser("status", help="show configured profiles and SSO freshness")
+    p_status.set_defaults(func=cmd_status)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

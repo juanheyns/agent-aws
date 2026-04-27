@@ -1,0 +1,30 @@
+;; agent-aws sandbox profile (macOS sandbox-exec)
+;;
+;; Threat model: the sandboxed process has been handed short-lived ReadOnly
+;; STS credentials via a temp credentials file pointed at by AWS_SHARED_-
+;; CREDENTIALS_FILE / AWS_CONFIG_FILE. We must prevent it from upgrading to
+;; admin-equivalent material. The known upgrade paths:
+;;
+;;   1. Reading the developer's normal SSO token cache and calling
+;;      `sso:GetRoleCredentials` against the Administrator role.
+;;   2. Reading any cached admin credentials file (e.g. ~/.aws/credentials).
+;;   3. Reading agent-aws's own state to learn which other accounts/roles
+;;      are configured.
+;;
+;; All three live under ~/.aws or ~/.agent-aws — denying file-read* on those
+;; subtrees closes the gap. Sandbox-exec uses a more-specific-rule-wins
+;; model, so a single subpath deny overrides the broad `(allow default)`.
+
+(version 1)
+
+(allow default)
+
+(deny file-read*
+  (subpath (param "HOME_AWS_DIR"))
+  (subpath (param "AGENT_DIR")))
+
+;; Belt-and-braces: even if some symlinked path slips past the subpath rules
+;; above, deny direct reads of common cache filenames anywhere on disk.
+(deny file-read*
+  (regex #"/\.aws/sso/cache/.*\.json$")
+  (regex #"/\.aws/credentials$"))
