@@ -24,7 +24,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 HOME = Path.home()
 AWS_DIR = HOME / ".aws"
