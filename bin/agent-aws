@@ -229,7 +229,11 @@ def default_path():
     if IS_MACOS:
         parts.append("/opt/homebrew/bin")
     if IS_LINUX:
-        parts.extend(["/usr/local/sbin", "/usr/sbin", str(HOME / ".local" / "bin")])
+        parts.extend(["/usr/local/sbin", "/usr/sbin"])
+    # ~/.local/bin is the standard install location for tools like the
+    # Claude Code CLI on both macOS and Linux. Include it in the fallback
+    # so the sandbox PATH is sane even if the parent shell didn't export one.
+    parts.append(str(HOME / ".local" / "bin"))
     return ":".join(parts)
 
 
@@ -363,7 +367,12 @@ def cmd_run(args):
         "USER": os.environ.get("USER", ""),
         "LOGNAME": os.environ.get("LOGNAME", ""),
         "TERM": os.environ.get("TERM", "xterm-256color"),
-        "PATH": default_path(),
+        # PATH is inherited from the parent shell so binaries installed in
+        # user-specific locations (~/.local/bin, ~/.claude/local, asdf/volta
+        # shims, etc.) are discoverable. PATH itself is not credential-
+        # sensitive — credential isolation is enforced by the sandbox's FS
+        # rules and env scrubbing of AWS_*, not by hiding binaries.
+        "PATH": os.environ.get("PATH") or default_path(),
         "LANG": os.environ.get("LANG", "en_US.UTF-8"),
         "AWS_CONFIG_FILE": str(cfg_file),
         "AWS_SHARED_CREDENTIALS_FILE": str(cred_file),
