@@ -1,6 +1,9 @@
 name: Publish to Homebrew tap
 
 on:
+  push:
+    tags:
+      - "v*"
   release:
     types: [published]
   workflow_dispatch:
@@ -12,6 +15,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: publish-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -21,11 +28,21 @@ jobs:
       - name: Resolve tag
         id: tag
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            tag="${{ github.event.release.tag_name }}"
-          else
-            tag="${{ inputs.tag }}"
-          fi
+          case "${{ github.event_name }}" in
+            push)
+              tag="${{ github.ref_name }}"
+              ;;
+            release)
+              tag="${{ github.event.release.tag_name }}"
+              ;;
+            workflow_dispatch)
+              tag="${{ inputs.tag }}"
+              ;;
+            *)
+              echo "unsupported event: ${{ github.event_name }}" >&2
+              exit 1
+              ;;
+          esac
           version="${tag#v}"
           echo "tag=$tag"          >> "$GITHUB_OUTPUT"
           echo "version=$version"  >> "$GITHUB_OUTPUT"
