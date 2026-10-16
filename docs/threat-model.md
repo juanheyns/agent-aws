@@ -7,7 +7,7 @@ access to the account. The threat is the *agent* — Claude or any other
 process the developer hands credentials to — being prompt-injected, making a
 mistake, or otherwise behaving in ways the developer didn't intend.
 
-Step 1 isolates known credential stores and persistence paths. IAM must enforce
+Step 1 isolates known credential stores and the listed startup paths. IAM must enforce
 read-only permissions; unrestricted network access remains a separate risk.
 
 ## What we're *not* defending against
@@ -60,7 +60,14 @@ writes the resulting short-lived STS credentials to a per-invocation tempdir
 at `/tmp/agent-aws.XXXX/`.
 
 The role name passed to `GetRoleCredentials` is hardcoded from
-`~/.agent-aws/config.json`, never read from the agent's environment.
+`~/.agent-aws/config.json`, never read from the agent's environment. Before
+reading tokens, the wrapper pins the AWS CLI to its resolved absolute path.
+The sandbox denies writes to every directory in the launch PATH (including
+missing earlier entries), their resolved targets, CLI/interpreter installation
+prefixes, and their ancestors. This prevents a run from planting an `aws`
+that a later run executes with the SSO token. The developer still supplies a
+trusted initial PATH and installation; this is not a scan of pre-existing
+executables for malicious content.
 
 ### 3. Filesystem sandbox
 
@@ -76,6 +83,15 @@ to `~/.aws/` and `~/.agent-aws/`:
       (subpath (param "HOME_AWS_DIR"))
       (subpath (param "AGENT_DIR")))
     ```
+
+    The static profile is combined with generated path rules. Protected
+    paths and their resolved targets deny writes; every ancestor has a literal
+    write deny to stop rename-and-restore attacks while leaving ordinary
+    siblings writable. The launcher path and interpreter are included.
+    Other runs' files deny both reads and writes; only this run's credential
+    directory gets an exception. Metadata lookup is allowed only for run
+    directory names and their `credentials`/`config` files so the spec's glob
+    reports denied reads. Contents and directory listings remain denied.
 
     Even reads via symlink are blocked by belt-and-braces regex denies on
     `*/.aws/sso/cache/*.json` and `*/.aws/credentials`.
@@ -130,6 +146,13 @@ IAM `AccessDenied`.
 ## Out of scope
 
 These are real risks `agent-aws` does *not* address:
+
+- **Other persistence classes.** Git/SSH configuration, agent settings and
+  hooks, executable directories outside the launch PATH, and mutable Homebrew
+  dependencies outside protected installation prefixes remain gaps. The PATH
+  used by a later unsandboxed invocation can also differ. This is protection
+  for the listed paths, not complete host isolation. Follow-up:
+  [remaining host persistence paths](https://github.com/juanheyns/agent-aws/issues/4).
 
 - **Found credentials and local services.** Network access remains open.
   Credentials in project files, metadata services, and reachable unsandboxed

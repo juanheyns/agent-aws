@@ -1,6 +1,8 @@
 import argparse
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -129,7 +131,8 @@ class ConfigTests(unittest.TestCase):
     def test_ai_agent_discovery_local_and_sso(self):
         src = {"sso_session": "s", "sso_account_id": "111111111111", "sso_role_name": "ReadOnlyAccess"}
         sessions = {"s": {"sso_start_url": "url", "sso_region": "us-east-1"}}
-        with mock.patch.object(agent.subprocess, "run") as run:
+        with mock.patch.object(agent, "resolve_aws_cli", return_value="/trusted/aws"), \
+             mock.patch.object(agent.subprocess, "run") as run:
             self.assertEqual(agent.preferred_role(src, sessions, {
                 "agent": dict(src, sso_role_name="ai-agent")}, {}), "ai-agent")
             run.assert_not_called()
@@ -157,6 +160,44 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("--tmpfs /tmp", joined)
         self.assertNotIn("--unshare-net", argv)
         self.assertFalse((self.home / ".bashrc").exists())
+
+    def test_review7_config_diagnostics(self):
+        self.path.write_text("{")
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error), self.assertRaises(SystemExit):
+            agent.load_config()
+        self.assertIn("invalid config JSON", error.getvalue())
+        self.assertNotIn("symlink", error.getvalue())
+        target = self.home / "target"
+        self.path.rename(target)
+        self.path.symlink_to(target)
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error), self.assertRaises(SystemExit):
+            agent.load_config()
+        self.assertIn("must not be a symlink", error.getvalue())
+
+    def test_review8_invalid_config_shapes(self):
+        for cfg in ([], {}, {"profiles": []}, {"profiles": {"test": "invalid"}}):
+            self.path.write_text(json.dumps(cfg))
+            error = io.StringIO()
+            with contextlib.redirect_stderr(error), self.assertRaises(SystemExit):
+                agent.load_config()
+            self.assertIn("must be", error.getvalue())
+
+    def test_review4_interpreter_protection_and_formula_shebang(self):
+        interpreter = self.home / "runtime/bin/python3"
+        with mock.patch.object(agent.sys, "executable", str(interpreter)):
+            paths = agent.protected_paths()
+        self.assertIn(interpreter, paths)
+        formula = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn('depends_on "python@3.14"', formula)
+        self.assertIn('rewrite_shebang detected_python_shebang, "bin/agent-aws"', formula)
+
+    def test_review1_mint_uses_resolved_absolute_cli(self):
+        with mock.patch.object(agent.subprocess, "run", return_value=mock.Mock(
+                returncode=0, stdout='{"roleCredentials": {}}')) as run:
+            agent.mint_role_creds("fake-token", config()["profiles"]["test"], "/trusted/aws")
+        self.assertEqual(run.call_args.args[0][0], "/trusted/aws")
 
 
 if __name__ == "__main__":

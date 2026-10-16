@@ -24,10 +24,15 @@ profile is permissive by default and explicitly denies reads and writes on
 ```
 
 Reads and writes return `Operation not permitted` (`EPERM`). Writes to shell
-startup files, `~/Library/LaunchAgents`, `~/.config/brnr`, and the resolved
-installation directory are also denied, including startup-file symlink targets.
-Other runs' credential contents are unreadable; pathname metadata is allowed
-so shell globs report denied files rather than silently skipping them.
+startup files (`.zshrc`, `.zprofile`, `.zshenv`, `.zlogin`, `.zlogout`,
+`.bashrc`, `.bash_profile`, `.bash_login`, `.bash_logout`, `.profile`),
+`~/Library/LaunchAgents`, `~/.config/brnr`, `~/.config/systemd/user`,
+`~/.config/autostart`, and the resolved installation directory are denied.
+Generated rules protect conventional paths, resolved targets, and every
+ancestor against rename. Launch PATH directories, launcher paths, and the
+Python/AWS CLI installation prefixes are protected too.
+Other runs' files are unreadable and unwritable; limited pathname metadata
+is allowed so shell globs report denied files rather than silently skipping them.
 `open`, `osascript`, `launchctl`, mounts, and the Launch Services / quarantine
 Mach services named in the sandbox profile are denied.
 
@@ -55,12 +60,14 @@ Networking is still shared; the egress lock is a separate future step.
 
 Existing shell startup files, `~/.config/brnr`, `~/Library/LaunchAgents`, and
 the installation directory are mounted read-only. A private directory skeleton
-for HOME, `.config`, and `Library` prevents a missing protected path from being
-created persistently on the host. Existing ordinary children (such as project
-directories) are bound read-write. **New top-level entries in these three
+for HOME and the parents of protected paths prevents a missing protected path
+from being created persistently on the host. Linux also protects systemd user
+units and autostart entries. Existing ordinary children (such as project
+directories) are bound read-write. **New entries in these
 skeleton directories disappear when the run ends**; create new projects inside
 an existing writable directory. Symlink targets of protected startup files are
-also read-only. This avoids the missing-file hole in `--ro-bind-try`.
+also read-only, including targets reached through symlinked ancestors. Launch
+PATH directories and executable installation paths are protected too. This avoids the missing-file hole in `--ro-bind-try`.
 
 ### Unprivileged user namespaces
 

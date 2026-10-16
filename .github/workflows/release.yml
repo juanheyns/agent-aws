@@ -97,9 +97,12 @@ jobs:
             sha256 "${{ steps.tarball.outputs.sha }}"
             license "MIT"
 
-            uses_from_macos "python"
+            include Language::Python::Shebang
+
+            depends_on "python@3.14"
 
             def install
+              rewrite_shebang detected_python_shebang, "bin/agent-aws"
               bin.install "bin/agent-aws"
               pkgshare.install "share/agent-aws/agent-aws.sb"
             end

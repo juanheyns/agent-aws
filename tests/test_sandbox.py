@@ -6,6 +6,7 @@ On Linux the same fixture exercises bwrap when it is installed.
 """
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -26,7 +27,7 @@ class SandboxTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix="sandbox-check-", dir="/tmp")
         cls.home = Path(cls.tmp.name).resolve()
         cls.env = dict(os.environ, HOME=str(cls.home))
-        for relative in (".aws/sso/cache", ".agent-aws", "Library/LaunchAgents", ".config/brnr", "bin", "project"):
+        for relative in (".aws/sso/cache", ".agent-aws", "Library/LaunchAgents", ".config/brnr", "bin", "project", ".local/bin"):
             (cls.home / relative).mkdir(parents=True)
         for name in (".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile", ".profile", ".aws/config"):
             (cls.home / name).write_text("# sentinel\n")
@@ -39,14 +40,14 @@ class SandboxTests(unittest.TestCase):
             "expiresAt": "2999-01-01T00:00:00Z",
         }))
         fake_aws = cls.home / "bin/aws"
-        fake_aws.write_text(f"#!{sys.executable}\n" + '''import json, sys
+        fake_aws.write_text(f"#!{sys.executable}\n" + '''import json, os, sys
 if sys.argv[1:3] != ["sso", "get-role-credentials"]:
     sys.exit("unexpected fake AWS call")
-print(json.dumps({"roleCredentials": {"accessKeyId": "FAKE-KEY",
+print(json.dumps({"roleCredentials": {"accessKeyId": os.environ.get("FAKE_AWS_KEY", "FAKE-KEY"),
     "secretAccessKey": "FAKE-SECRET", "sessionToken": "FAKE-SESSION"}}))
 ''')
         fake_aws.chmod(0o700)
-        cls.env["PATH"] = f"{cls.home}/bin:" + os.environ["PATH"]
+        cls.env["PATH"] = f"{cls.home}/.local/bin:{cls.home}/bin:" + os.environ["PATH"]
         cls.base = [sys.executable, str(ROOT / "bin/agent-aws"), "run", "--", "/bin/sh", "-c"]
         result = cls.run_shell('test "$AGENT_AWS_ACTIVE" = 1 && cat "$AWS_SHARED_CREDENTIALS_FILE"')
         if result.returncode or "FAKE-KEY" not in result.stdout:
@@ -67,6 +68,7 @@ print(json.dumps({"roleCredentials": {"accessKeyId": "FAKE-KEY",
         self.assertNotEqual(result.returncode, 0, command)
         self.assertRegex(result.stderr.lower(), "not permitted|permission denied|read-only file system")
         print(f"ACCEPTANCE PASS: {command} [exit {result.returncode}; {result.stderr.strip()}]", flush=True)
+        return result
 
     def test_01_config_overwrite(self):
         before = self.config_path.read_text()
@@ -93,7 +95,8 @@ print(json.dumps({"roleCredentials": {"accessKeyId": "FAKE-KEY",
         other = subprocess.Popen(self.base + [
             'echo "$AWS_SHARED_CREDENTIALS_FILE" > "$HOME/project/ready"; '
             'while [ ! -f "$HOME/project/stop" ]; do sleep 0.1; done'
-        ], env=self.env, cwd=self.home, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        ], env=dict(self.env, FAKE_AWS_KEY="FAKE-OTHER"), cwd=self.home,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             deadline = time.monotonic() + 10
             while not ready.exists() and other.poll() is None and time.monotonic() < deadline:
@@ -104,8 +107,20 @@ print(json.dumps({"roleCredentials": {"accessKeyId": "FAKE-KEY",
                 self.run_shell(f'cat "{other_creds}"').returncode, 0)
             # Do not print stdout: a regression could expose another run's secret.
             if sys.platform == "darwin":
-                self.denied('cat /tmp/agent-aws.*/credentials')
+                glob = self.denied('cat /tmp/agent-aws.*/credentials')
+                self.assertIn('FAKE-KEY', glob.stdout)
+                self.assertNotIn('FAKE-OTHER', glob.stdout)
                 self.denied(f'cat "{Path(other_creds).resolve()}"')
+            other_config = str(Path(other_creds).with_name("config"))
+            before = Path(other_config).read_text()
+            for command in (
+                f'mv "{other_creds}" "$(dirname "$AWS_SHARED_CREDENTIALS_FILE")/stolen-mv"',
+                f'printf "credential_process=/tmp/evil\\n" >> "{other_config}"',
+            ):
+                result = self.run_shell(command)
+                self.assertNotEqual(result.returncode, 0, command)
+            self.assertTrue(Path(other_creds).exists())
+            self.assertEqual(Path(other_config).read_text(), before)
         finally:
             stop.touch()
             other.communicate(timeout=10)
@@ -169,6 +184,126 @@ sys.exit(0 if rc == 0 else 1)
         inside = self.run_shell(f'"{sys.executable}" "$HOME/mach_probe.py"')
         self.assertNotEqual(inside.returncode, 0)
         print(f"MACH LOOKUP: outside={outside.stdout.strip()}, inside={inside.stdout.strip()}", flush=True)
+
+    def test_review1_aws_path_poisoning_across_runs(self):
+        # The candidate precedes the real fixture CLI and does not yet exist.
+        candidate = self.home / ".local/bin/aws"
+        marker = self.home / "project/stolen-token"
+        payload = '#!/bin/sh\necho stolen > "$HOME/project/stolen-token"\n'
+        self.denied(f'printf %s {shlex.quote(payload)} > "$HOME/.local/bin/aws"')
+        self.assertFalse(candidate.exists())
+        next_run = self.run_shell('test "$AGENT_AWS_ACTIVE" = 1')
+        self.assertEqual(next_run.returncode, 0, next_run.stderr)
+        self.assertFalse(marker.exists())
+        # An absent earlier PATH directory must not be persistently planted.
+        missing = self.home / ".local/missing-bin"
+        old_path = self.env["PATH"]
+        self.env["PATH"] = f"{missing}:" + old_path
+        try:
+            self.run_shell('mkdir -p "$HOME/.local/missing-bin" && '
+                           'echo evil > "$HOME/.local/missing-bin/aws"')
+            self.assertFalse((missing / "aws").exists())
+        finally:
+            self.env["PATH"] = old_path
+
+    def test_review3_parent_renames(self):
+        for parent in (".config", "Library"):
+            original = self.home / parent
+            moved = self.home / "project/moved-parent"
+            result = self.run_shell(f'mv "$HOME/{parent}" "{moved}"')
+            try:
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(original.exists())
+                self.assertFalse(moved.exists())
+            finally:
+                if moved.exists() and not original.exists():
+                    moved.rename(original)
+        dotfiles = self.home / "dotfiles"
+        dotfiles.mkdir(exist_ok=True)
+        target = dotfiles / "zshrc"
+        target.write_text("sentinel")
+        rc = self.home / ".zshrc"
+        rc.unlink()
+        rc.symlink_to(target)
+        moved = self.home / "project/df"
+        try:
+            result = self.run_shell('mv "$HOME/dotfiles" "$HOME/project/df" && '
+                                    'echo injected >> "$HOME/project/df/zshrc"')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(target.read_text(), "sentinel")
+        finally:
+            if moved.exists() and not dotfiles.exists():
+                moved.rename(dotfiles)
+            rc.unlink()
+            rc.write_text("# sentinel\n")
+
+    def test_review3_and_4_homebrew_parent_launcher_and_shim(self):
+        prefix = self.home / "brew"
+        install = prefix / "Cellar/agent-aws/1.0.0"
+        (install / "bin").mkdir(parents=True)
+        (install / "share/agent-aws").mkdir(parents=True)
+        script = install / "bin/agent-aws"
+        script.write_text((ROOT / "bin/agent-aws").read_text().replace(
+            "#!/usr/bin/env python3", f"#!{sys.executable}", 1))
+        script.chmod(0o700)
+        profile = install / "share/agent-aws/agent-aws.sb"
+        shutil.copyfile(ROOT / "share/agent-aws/agent-aws.sb", profile)
+        before_profile = profile.read_text()
+        (prefix / "bin").mkdir()
+        launcher = prefix / "bin/agent-aws"
+        launcher.symlink_to(script)
+        shim = prefix / "bin/python3"
+        shim.write_text('#!/bin/sh\nexit 77\n')
+        shim.chmod(0o700)
+        old_path = self.env["PATH"]
+        old_base = self.base
+        self.env["PATH"] = f"{prefix}/bin:" + old_path
+        # Invoke the installed shebang directly: the poisonous python3 shim
+        # must not run. All attacked paths below are disposable fixtures.
+        self.__class__.base = [str(launcher), "run", "--", "/bin/sh", "-c"]
+        try:
+            result = self.run_shell('test "$AGENT_AWS_ACTIVE" = 1')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for command in (
+                f'mv "{prefix}/Cellar/agent-aws" "{prefix}/Cellar/aa"',
+                f'ln -sfn /tmp/evil "{launcher}"',
+                f'echo injected >> "{shim}"',
+            ):
+                self.assertNotEqual(self.run_shell(command).returncode, 0, command)
+            self.assertEqual(launcher.resolve(), script)
+            self.assertEqual(shim.read_text(), '#!/bin/sh\nexit 77\n')
+            self.assertEqual(profile.read_text(), before_profile)
+        finally:
+            self.env["PATH"] = old_path
+            self.__class__.base = old_base
+
+    def test_review5_additional_startup_paths(self):
+        for name in (".zlogin", ".zlogout", ".bash_login", ".bash_logout"):
+            path = self.home / name
+            path.write_text("sentinel")
+            self.denied(f'echo injected >> "$HOME/{name}"')
+            self.assertEqual(path.read_text(), "sentinel")
+        for name in (".config/systemd/user", ".config/autostart"):
+            directory = self.home / name
+            directory.mkdir(parents=True, exist_ok=True)
+            self.denied(f'echo injected > "$HOME/{name}/evil"')
+            self.assertFalse((directory / "evil").exists())
+
+    def test_review6_symlinked_config_parent(self):
+        conventional = self.home / ".config"
+        target = self.home / "dotfiles/config"
+        target.parent.mkdir(exist_ok=True)
+        conventional.rename(target)
+        conventional.symlink_to(target)
+        config_file = target / "brnr/config.toml"
+        config_file.write_text("sentinel")
+        try:
+            self.denied('echo injected >> "$HOME/.config/brnr/config.toml"')
+            self.denied('echo injected >> "$HOME/dotfiles/config/brnr/config.toml"')
+            self.assertEqual(config_file.read_text(), "sentinel")
+        finally:
+            conventional.unlink()
+            target.rename(conventional)
 
 
 if __name__ == "__main__":

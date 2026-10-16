@@ -96,3 +96,9 @@ Use [SemVer](https://semver.org/). The current pre-1.0 contract:
 - Pre-1.0 minor bumps may include breaking changes to the
   `~/.agent-aws/config.json` schema, with an in-memory migration path
   preserved for at least one minor version.
+
+The tap formula declares a Homebrew Python dependency and rewrites the launcher
+shebang to that interpreter's absolute path using Homebrew's
+[`rewrite_shebang` helper](https://docs.brew.sh/Formula-Cookbook.html#rewriting-shebangs).
+The installed launcher does not resolve `python3` through the user's PATH.
+Source checkouts retain the portable shebang; run them with a trusted Python.

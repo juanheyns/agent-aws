@@ -13,32 +13,16 @@
   (regex #"/\.aws/sso/cache/.*\.json$")
   (regex #"/\.aws/credentials$"))
 
-;; Protect both conventional names and resolved targets (e.g. dotfile symlinks).
-(deny file-write*
-  (subpath (string-append (param "HOME") "/Library/LaunchAgents"))
-  (literal (string-append (param "HOME") "/.zshrc"))
-  (literal (string-append (param "HOME") "/.zprofile"))
-  (literal (string-append (param "HOME") "/.zshenv"))
-  (literal (string-append (param "HOME") "/.bashrc"))
-  (literal (string-append (param "HOME") "/.bash_profile"))
-  (literal (string-append (param "HOME") "/.profile"))
-  (subpath (string-append (param "HOME") "/.config/brnr"))
-  (subpath (param "AGENT_AWS_INSTALL_DIR"))
-  (subpath (param "STARTUP_0"))
-  (subpath (param "STARTUP_1"))
-  (subpath (param "STARTUP_2"))
-  (subpath (param "STARTUP_3"))
-  (subpath (param "STARTUP_4"))
-  (subpath (param "STARTUP_5"))
-  (subpath (param "STARTUP_6"))
-  (subpath (param "STARTUP_7")))
+;; Startup, executable, installation and ancestor write denies are generated
+;; by build_sandbox_argv_darwin; this static profile supplies the base rules.
 
 ;; Hide other runs, including paths reached through macOS's /tmp symlink.
-(deny file-read* (regex #"^/(private/)?tmp/agent-aws\."))
+(deny file-read* file-write* (regex #"^/(private/)?tmp/agent-aws\."))
 ;; Permit pathname lookup so shell globs do not silently omit other runs.
 ;; Their file contents and directory listings remain unreadable.
-(allow file-read-metadata (regex #"^/(private/)?tmp/agent-aws\."))
-(allow file-read* (subpath (param "CREDS_DIR")))
+(allow file-read-metadata
+  (regex #"^/(private/)?tmp/agent-aws\.[^/]+(/(credentials|config))?$"))
+(allow file-read* file-write* (subpath (param "CREDS_DIR")))
 
 (deny file-mount)
 (deny mach-lookup

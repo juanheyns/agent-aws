@@ -14,6 +14,7 @@ Layered design:
 
 import argparse
 import configparser
+import errno
 import json
 import os
 import shutil
@@ -42,7 +43,9 @@ ADMIN_BLOCKLIST = ("admin", "poweruser", "fullaccess")
 DEFAULT_ALLOWED_ROLES = ("ai-agent", "ReadOnlyAccess")
 STARTUP_PATHS = (
     ".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile", ".profile",
+    ".zlogin", ".zlogout", ".bash_login", ".bash_logout",
     "Library/LaunchAgents", ".config/brnr",
+    ".config/systemd/user", ".config/autostart",
 )
 INSTALL_DIR = SCRIPT_DIR.parent
 
@@ -75,18 +78,34 @@ def load_config():
             raw = json.load(f)
     except FileNotFoundError:
         die(f"no config at {AGENT_CONFIG} — run `agent-aws init` first")
-    except (OSError, ValueError) as exc:
-        die(f"cannot read config (symlinks are forbidden): {exc}")
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            die(f"config must not be a symlink: {AGENT_CONFIG}")
+        die(f"cannot read config: {exc}")
+    except ValueError as exc:
+        die(f"invalid config JSON: {exc}")
+    if not isinstance(raw, dict):
+        die("config must be a JSON object")
     # In-memory migration: pre-multi-profile schema had account_id at the top
     # level. Wrap it as a single profile named "default" so the rest of the
     # code path is uniform. The on-disk file is rewritten on next `init`.
     if "profiles" not in raw and "account_id" in raw:
         raw = {"default_profile": "default", "profiles": {"default": raw},
                "allowed_roles": raw.get("allowed_roles", list(DEFAULT_ALLOWED_ROLES))}
+    validate_config_shape(raw)
     return raw
 
 
+def validate_config_shape(cfg):
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("profiles"), dict):
+        die("config profiles must be an object")
+    for name, profile in cfg["profiles"].items():
+        if not isinstance(profile, dict):
+            die(f"profile '{name}' must be an object")
+
+
 def validate_roles(cfg):
+    validate_config_shape(cfg)
     allowed = cfg.get("allowed_roles", list(DEFAULT_ALLOWED_ROLES))
     if not isinstance(allowed, list) or not all(isinstance(r, str) and r for r in allowed):
         die("allowed_roles must be a list of non-empty role names")
@@ -101,7 +120,7 @@ def validate_roles(cfg):
                 "use `agent-aws init --role NAME` to approve a custom read-only role")
 
 
-def preferred_role(src, sessions, profiles, tokens):
+def preferred_role(src, sessions, profiles, tokens, aws_cli=None):
     """Prefer ai-agent when configured locally or returned by SSO; never log in."""
     session = sessions.get(src.get("sso_session"), {})
     account = src.get("sso_account_id")
@@ -112,7 +131,7 @@ def preferred_role(src, sessions, profiles, tokens):
     token = tokens.get(session.get("sso_start_url"))
     if token:
         result = subprocess.run([
-            "aws", "sso", "list-account-roles", "--account-id", account,
+            aws_cli or resolve_aws_cli(), "sso", "list-account-roles", "--account-id", account,
             "--access-token", token, "--region", session["sso_region"],
             "--output", "json",
         ], capture_output=True, text=True)
@@ -211,11 +230,12 @@ def cmd_init(args):
 
     if args.role and is_admin_role(args.role):
         die(f"refusing admin-equivalent role '{args.role}'")
+    aws_cli = resolve_aws_cli() if not args.role else None
     tokens = find_sso_tokens() if not args.role else {}
     new_profiles = {}
     for name in chosen:
         src = dict(eligible[name])
-        src["sso_role_name"] = args.role or preferred_role(src, sessions, profiles, tokens)
+        src["sso_role_name"] = args.role or preferred_role(src, sessions, profiles, tokens, aws_cli)
         new_profiles[name] = derive_profile_entry(name, src, sessions)
 
     if args.default:
@@ -289,10 +309,10 @@ def cmd_login(args):
     sys.exit(rc)
 
 
-def mint_role_creds(token, profile_cfg):
+def mint_role_creds(token, profile_cfg, aws_cli):
     r = subprocess.run(
         [
-            "aws", "sso", "get-role-credentials",
+            aws_cli, "sso", "get-role-credentials",
             "--role-name", profile_cfg["role_name"],
             "--account-id", profile_cfg["account_id"],
             "--access-token", token,
@@ -334,29 +354,69 @@ def check_sandbox_tool():
         die(f"unsupported platform: {sys.platform}")
 
 
+def executable_path():
+    return os.environ.get("PATH") or default_path()
+
+
+def resolve_aws_cli():
+    # Pin before reading SSO tokens. The child sandbox protects every PATH
+    # directory, its ancestors, and the resolved CLI installation against
+    # poisoning a later invocation (including an earlier, empty PATH entry).
+    path = shutil.which("aws", path=executable_path())
+    if not path:
+        die("aws CLI not found in PATH")
+    return str(Path(path).resolve())
+
+
+def protected_paths():
+    paths = {HOME / path for path in STARTUP_PATHS}
+    paths.update((INSTALL_DIR, AWS_DIR, AGENT_DIR))
+    paths.update(Path(part or os.curdir).absolute() for part in executable_path().split(os.pathsep))
+    # Preserve the lexical launcher path as well as its symlink target.
+    paths.update((Path(__file__).absolute(), Path(sys.argv[0]).absolute(),
+                  Path(sys.executable).absolute()))
+    for name in ("agent-aws", "python3", "aws"):
+        executable = shutil.which(name, path=executable_path())
+        if executable:
+            path = Path(executable).absolute()
+            paths.add(path)
+            # CLI/Python entry points can load sibling modules or libraries.
+            # Protect their installation prefix, not just the executable inode.
+            if name in ("aws", "python3"):
+                prefix = path.resolve().parent.parent
+                paths.add(prefix if prefix != HOME else path.resolve().parent)
+    paths.update((Path(sys.prefix), Path(sys.base_prefix)))
+    return paths | {path.resolve() for path in paths}
+
+
 def build_sandbox_argv_darwin(creds_dir):
-    argv = [
+    paths = protected_paths()
+    ancestors = {parent for path in paths for parent in path.parents}
+    # Literal ancestor denies stop rename-and-restore attacks without denying
+    # writes to ordinary siblings. JSON quoting also escapes Scheme strings.
+    rules = ["(deny file-write*"]
+    rules += [f"  (subpath {json.dumps(str(path), ensure_ascii=False)})" for path in sorted(paths)]
+    rules += [f"  (literal {json.dumps(str(path), ensure_ascii=False)})" for path in sorted(ancestors)]
+    rules.append(")")
+    return [
         "sandbox-exec",
         "-D", f"HOME={HOME.resolve()}",
         "-D", f"CREDS_DIR={creds_dir.resolve()}",
-        "-D", f"AGENT_AWS_INSTALL_DIR={INSTALL_DIR.resolve()}",
         "-D", f"HOME_AWS_DIR={AWS_DIR.resolve()}",
         "-D", f"AGENT_DIR={AGENT_DIR.resolve()}",
+        "-p", SANDBOX_PROFILE.read_text() + "\n" + "\n".join(rules),
     ]
-    # Protect symlink targets as well as the conventional startup paths.
-    for index, path in enumerate(STARTUP_PATHS):
-        argv += ["-D", f"STARTUP_{index}={(HOME / path).resolve()}"]
-    return argv + ["-f", str(SANDBOX_PROFILE)]
 
 
 def linux_home_mounts():
-    # A private directory skeleton lets absent startup paths be created only
-    # inside the sandbox. A plain rw home + ro-bind-try would let a missing rc
-    # file be planted on the host. Existing ordinary children remain writable.
+    # Private skeletons prevent missing protected paths from being planted on
+    # the host. Existing unprotected children (e.g. projects) remain writable.
     argv = []
-    protected = {HOME / path for path in STARTUP_PATHS}
+    protected = protected_paths()
     private = {AWS_DIR, AGENT_DIR}
-    containers = {HOME, HOME / ".config", HOME / "Library"}
+    containers = {HOME}
+    containers.update(parent for path in protected for parent in path.parents
+                      if HOME in parent.parents)
 
     def mirror(directory):
         argv.extend(["--tmpfs", str(directory)])
@@ -365,21 +425,26 @@ def linux_home_mounts():
         for child in sorted(directory.iterdir()):
             if child in private:
                 continue
-            if child in containers:
-                mirror(child)
-            elif child in protected:
+            if child in protected:
                 argv.extend(["--ro-bind", str(child.resolve()), str(child)])
+            elif child in containers:
+                mirror(child)
             elif child.is_symlink():
                 argv.extend(["--symlink", os.readlink(child), str(child)])
             else:
                 argv.extend(["--bind", str(child), str(child)])
+        # Missing children are private to this skeleton; no host files are
+        # created just to provide bind-mount destinations.
 
-    mirror(HOME)
+    if HOME in protected:
+        argv += ["--ro-bind", str(HOME), str(HOME)]
+    else:
+        mirror(HOME)
     for path in sorted(private | {p.resolve() for p in private}):
         argv += ["--tmpfs", str(path), "--remount-ro", str(path)]
-    # Direct access to dotfile symlink targets must also be read-only.
-    for path in sorted(protected):
-        if path.exists() and path.is_symlink():
+    # Include targets with symlinked ancestors, not only final-component links.
+    for path in sorted(protected - private):
+        if path.exists() and path.resolve() != path:
             argv += ["--ro-bind", str(path.resolve()), str(path.resolve())]
     return argv
 
@@ -439,6 +504,7 @@ def cmd_run(args):
         active = profiles
         active_default = cfg.get("default_profile") or next(iter(profiles))
 
+    aws_cli = resolve_aws_cli()
     tokens = find_sso_tokens()
     needed = {p["sso_start_url"] for p in active.values()}
     missing = needed - set(tokens.keys())
@@ -452,7 +518,7 @@ def cmd_run(args):
 
     cred_lines, cfg_lines = [], []
     for name, p in active.items():
-        creds = mint_role_creds(tokens[p["sso_start_url"]], p)
+        creds = mint_role_creds(tokens[p["sso_start_url"]], p, aws_cli)
         sections = [name, "default"] if name == active_default else [name]
         for sect in sections:
             cred_lines += [
@@ -486,10 +552,9 @@ def cmd_run(args):
         "TERM": os.environ.get("TERM", "xterm-256color"),
         # PATH is inherited from the parent shell so binaries installed in
         # user-specific locations (~/.local/bin, ~/.claude/local, asdf/volta
-        # shims, etc.) are discoverable. PATH itself is not credential-
-        # sensitive — credential isolation is enforced by the sandbox's FS
-        # rules and env scrubbing of AWS_*, not by hiding binaries.
-        "PATH": os.environ.get("PATH") or default_path(),
+        # shims, etc.) are discoverable. These directories and their ancestors
+        # are write-protected to prevent poisoning the next unsandboxed run.
+        "PATH": executable_path(),
         "LANG": os.environ.get("LANG", "en_US.UTF-8"),
         "AWS_CONFIG_FILE": str(cfg_file),
         "AWS_SHARED_CREDENTIALS_FILE": str(cred_file),
