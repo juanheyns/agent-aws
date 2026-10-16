@@ -101,4 +101,8 @@ The tap formula declares a Homebrew Python dependency and rewrites the launcher
 shebang to that interpreter's absolute path using Homebrew's
 [`rewrite_shebang` helper](https://docs.brew.sh/Formula-Cookbook.html#rewriting-shebangs).
 The installed launcher does not resolve `python3` through the user's PATH.
-Source checkouts retain the portable shebang; run them with a trusted Python.
+Both forms retain `-I` to disable user-site startup code before the script runs.
+The formula first normalizes `env -S python3 -I` to `env python3 -I` so the
+Homebrew helper recognizes the shebang and preserves its isolated-mode argument.
+Source checkouts use `#!/usr/bin/env -S python3 -I`; explicit interpreter calls
+must use `python3 -I bin/agent-aws`.

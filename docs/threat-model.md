@@ -69,6 +69,15 @@ that a later run executes with the SSO token. The developer still supplies a
 trusted initial PATH and installation; this is not a scan of pre-existing
 executables for malicious content.
 
+Both the source and Homebrew launchers start Python in
+[isolated mode (`-I`)](https://docs.python.org/3/using/cmdline.html#cmdoption-I),
+so user site-packages startup code (including `.pth` files) and Python
+startup environment variables cannot run before the wrapper. The interpreter's
+user site-packages directory, resolved target, and ancestors are also protected
+against sandbox writes. When invoking the script through Python explicitly,
+use `python3 -I bin/agent-aws`; flags in a shebang do not apply to such calls.
+System/installation site-packages remain part of the trusted Python installation.
+
 ### 3. Filesystem sandbox
 
 The wrapped command runs under a platform-native sandbox that denies access

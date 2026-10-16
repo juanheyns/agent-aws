@@ -192,6 +192,7 @@ class ConfigTests(unittest.TestCase):
         formula = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertIn('depends_on "python@3.14"', formula)
         self.assertIn('rewrite_shebang detected_python_shebang, "bin/agent-aws"', formula)
+        self.assertIn('"#!/usr/bin/env -S python3 -I", "#!/usr/bin/env python3 -I"', formula)
 
     def test_review1_mint_uses_resolved_absolute_cli(self):
         with mock.patch.object(agent.subprocess, "run", return_value=mock.Mock(

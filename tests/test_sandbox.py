@@ -26,7 +26,8 @@ class SandboxTests(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(prefix="sandbox-check-", dir="/tmp")
         cls.home = Path(cls.tmp.name).resolve()
-        cls.env = dict(os.environ, HOME=str(cls.home))
+        cls.env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+        cls.env["HOME"] = str(cls.home)
         for relative in (".aws/sso/cache", ".agent-aws", "Library/LaunchAgents", ".config/brnr", "bin", "project", ".local/bin"):
             (cls.home / relative).mkdir(parents=True)
         for name in (".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile", ".profile", ".aws/config"):
@@ -40,7 +41,7 @@ class SandboxTests(unittest.TestCase):
             "expiresAt": "2999-01-01T00:00:00Z",
         }))
         fake_aws = cls.home / "bin/aws"
-        fake_aws.write_text(f"#!{sys.executable}\n" + '''import json, os, sys
+        fake_aws.write_text(f"#!{sys.executable} -I\n" + '''import json, os, sys
 if sys.argv[1:3] != ["sso", "get-role-credentials"]:
     sys.exit("unexpected fake AWS call")
 print(json.dumps({"roleCredentials": {"accessKeyId": os.environ.get("FAKE_AWS_KEY", "FAKE-KEY"),
@@ -48,7 +49,9 @@ print(json.dumps({"roleCredentials": {"accessKeyId": os.environ.get("FAKE_AWS_KE
 ''')
         fake_aws.chmod(0o700)
         cls.env["PATH"] = f"{cls.home}/.local/bin:{cls.home}/bin:" + os.environ["PATH"]
-        cls.base = [sys.executable, str(ROOT / "bin/agent-aws"), "run", "--", "/bin/sh", "-c"]
+        (cls.home / "bin/python3").symlink_to(sys.executable)
+        # Exercise the source shebang, not a caller-supplied Python flag.
+        cls.base = [str(ROOT / "bin/agent-aws"), "run", "--", "/bin/sh", "-c"]
         result = cls.run_shell('test "$AGENT_AWS_ACTIVE" = 1 && cat "$AWS_SHARED_CREDENTIALS_FILE"')
         if result.returncode or "FAKE-KEY" not in result.stdout:
             cls.tmp.cleanup()
@@ -258,7 +261,7 @@ sys.exit(0 if rc == 0 else 1)
         (install / "share/agent-aws").mkdir(parents=True)
         script = install / "bin/agent-aws"
         script.write_text((ROOT / "bin/agent-aws").read_text().replace(
-            "#!/usr/bin/env python3", f"#!{sys.executable}", 1))
+            "#!/usr/bin/env -S python3 -I", f"#!{sys.executable} -I", 1))
         script.chmod(0o700)
         profile = install / "share/agent-aws/agent-aws.sb"
         shutil.copyfile(ROOT / "share/agent-aws/agent-aws.sb", profile)
@@ -318,6 +321,64 @@ sys.exit(0 if rc == 0 else 1)
         finally:
             conventional.unlink()
             target.rename(conventional)
+
+    def test_round2_user_site_pth_does_not_run(self):
+        probe = subprocess.run(
+            [sys.executable, "-I", "-c", "import site; print(site.getusersitepackages())"],
+            env=self.env, capture_output=True, text=True, check=True)
+        user_site = Path(probe.stdout.strip()).resolve()
+        self.assertIn(self.home, user_site.parents, "user site must stay inside scratch HOME")
+        user_site.mkdir(parents=True, exist_ok=True)
+        pth = user_site / "zz-agent-aws-test.pth"
+        marker = self.home / "project/pth-ran"
+        fake_cache = self.home / ".aws/sso/cache"
+        payload = (f"import pathlib; pathlib.Path({str(marker)!r}).write_text("
+                   f"str(list(pathlib.Path({str(fake_cache)!r}).iterdir())))\n")
+        try:
+            # Run 1 cannot persist user-site startup code; run 2 still works.
+            self.denied(f"printf %s {shlex.quote(payload)} > {shlex.quote(str(pth))}")
+            self.assertFalse(pth.exists())
+            next_run = self.run_shell('test "$AGENT_AWS_ACTIVE" = 1')
+            self.assertEqual(next_run.returncode, 0, next_run.stderr)
+            self.assertFalse(marker.exists())
+
+            # Independently verify -I: preseed the scratch fixture outside the
+            # sandbox. A non-isolated Python must execute it (positive control).
+            pth.write_text(payload)
+            subprocess.run([sys.executable, "-c", "pass"], env=self.env, check=True)
+            self.assertIn("fake.json", marker.read_text())
+            marker.unlink()
+            next_run = self.run_shell('test "$AGENT_AWS_ACTIVE" = 1')
+            self.assertEqual(next_run.returncode, 0, next_run.stderr)
+            self.assertFalse(marker.exists(), "source shebang executed user-site startup code")
+
+            # The installed form must also keep -I after its absolute Python.
+            installed = self.home / "project/installed"
+            (installed / "bin").mkdir(parents=True)
+            (installed / "share/agent-aws").mkdir(parents=True)
+            script = installed / "bin/agent-aws"
+            script.write_text((ROOT / "bin/agent-aws").read_text().replace(
+                "#!/usr/bin/env -S python3 -I", f"#!{sys.executable} -I", 1))
+            script.chmod(0o700)
+            shutil.copyfile(ROOT / "share/agent-aws/agent-aws.sb",
+                            installed / "share/agent-aws/agent-aws.sb")
+            result = subprocess.run([str(script), "run", "--", "/bin/sh", "-c", "true"],
+                                    env=self.env, cwd=self.home, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(marker.exists(), "installed shebang executed user-site startup code")
+        finally:
+            pth.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+
+    def test_round2_relative_path_warning(self):
+        old_path = self.env["PATH"]
+        self.env["PATH"] = old_path + ":."
+        try:
+            result = self.run_shell("true")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("empty or dot PATH entries protect the current directory", result.stderr)
+        finally:
+            self.env["PATH"] = old_path
 
 
 if __name__ == "__main__":

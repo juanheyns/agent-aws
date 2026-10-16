@@ -110,3 +110,10 @@ returning an argv list, plus a presence check in `check_sandbox_tool()`,
 and dispatch from `build_sandbox_argv()`.
 
 The cred-minting code path is platform-agnostic and won't need to change.
+
+Launchers use Python isolated mode (`-I`), and the interpreter's user
+site-packages directory is write-protected to prevent `.pth` startup injection.
+All launch-PATH directories are read-only: self-updates and global package
+installs into those directories must run outside the sandbox. Empty or `.`
+PATH entries also protect the current directory and produce a warning; use
+absolute entries to avoid making a working directory read-only.
