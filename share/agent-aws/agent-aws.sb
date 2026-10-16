@@ -1,30 +1,34 @@
-;; agent-aws sandbox profile (macOS sandbox-exec)
-;;
-;; Threat model: the sandboxed process has been handed short-lived ReadOnly
-;; STS credentials via a temp credentials file pointed at by AWS_SHARED_-
-;; CREDENTIALS_FILE / AWS_CONFIG_FILE. We must prevent it from upgrading to
-;; admin-equivalent material. The known upgrade paths:
-;;
-;;   1. Reading the developer's normal SSO token cache and calling
-;;      `sso:GetRoleCredentials` against the Administrator role.
-;;   2. Reading any cached admin credentials file (e.g. ~/.aws/credentials).
-;;   3. Reading agent-aws's own state to learn which other accounts/roles
-;;      are configured.
-;;
-;; All three live under ~/.aws or ~/.agent-aws — denying file-read* on those
-;; subtrees closes the gap. Sandbox-exec uses a more-specific-rule-wins
-;; model, so a single subpath deny overrides the broad `(allow default)`.
-
+;; agent-aws step 1: protect credentials and known persistence/launch paths.
+;; Network access remains open until the separate egress-lock step.
 (version 1)
-
 (allow default)
 
-(deny file-read*
+(deny file-read* file-write*
+  (subpath (string-append (param "HOME") "/.aws"))
+  (subpath (string-append (param "HOME") "/.agent-aws"))
   (subpath (param "HOME_AWS_DIR"))
   (subpath (param "AGENT_DIR")))
 
-;; Belt-and-braces: even if some symlinked path slips past the subpath rules
-;; above, deny direct reads of common cache filenames anywhere on disk.
 (deny file-read*
   (regex #"/\.aws/sso/cache/.*\.json$")
   (regex #"/\.aws/credentials$"))
+
+;; Startup, executable, installation and ancestor write denies are generated
+;; by build_sandbox_argv_darwin; this static profile supplies the base rules.
+
+;; Hide other runs, including paths reached through macOS's /tmp symlink.
+(deny file-read* file-write* (regex #"^/(private/)?tmp/agent-aws\."))
+;; Permit pathname lookup so shell globs do not silently omit other runs.
+;; Their file contents and directory listings remain unreadable.
+(allow file-read-metadata
+  (regex #"^/(private/)?tmp/agent-aws\.[^/]+(/(credentials|config))?$"))
+(allow file-read* file-write* (subpath (param "CREDS_DIR")))
+
+(deny file-mount)
+(deny mach-lookup
+  (global-name "com.apple.coreservices.launchservicesd")
+  (global-name "com.apple.coreservices.quarantine-resolver"))
+(deny process-exec
+  (literal "/usr/bin/open")
+  (literal "/usr/bin/osascript")
+  (literal "/bin/launchctl"))
