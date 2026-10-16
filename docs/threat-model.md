@@ -7,7 +7,8 @@ access to the account. The threat is the *agent* — Claude or any other
 process the developer hands credentials to — being prompt-injected, making a
 mistake, or otherwise behaving in ways the developer didn't intend.
 
-Goal: even when the agent goes off the rails, the worst it can do is read.
+Step 1 isolates known credential stores and persistence paths. IAM must enforce
+read-only permissions; unrestricted network access remains a separate risk.
 
 ## What we're *not* defending against
 
@@ -35,8 +36,9 @@ aws sso get-role-credentials \
 
 ## Layered defenses
 
-`agent-aws` stacks four independent defenses, each of which alone would be
-sufficient to block an agent from gaining admin credentials.
+`agent-aws` combines configuration checks, credential minting, filesystem
+isolation, and environment scrubbing. These defenses do not replace IAM or
+the planned egress lock.
 
 ### 1. Scoped configuration
 
@@ -44,8 +46,11 @@ sufficient to block an agent from gaining admin credentials.
 names. Init refuses to write a config containing any role whose name matches
 `*admin*`, `*poweruser*`, or `*fullaccess*` (case-insensitive).
 
-This is the baseline correctness check — even a misconfigured machine can't
-accidentally hand the agent admin scope.
+Every run repeats the blocklist and `allowed_roles` checks for all profiles,
+even with `--profile`. Config reads refuse wrong ownership, modes other than
+`0600`, and symlinks. Custom names require explicit approval through
+`init --role` or a developer edit to `allowed_roles`. This validates names,
+not the underlying IAM policy.
 
 ### 2. Cred minting outside the sandbox
 
@@ -67,7 +72,7 @@ to `~/.aws/` and `~/.agent-aws/`:
     `sandbox-exec` with `share/agent-aws/agent-aws.sb`:
 
     ```scheme
-    (deny file-read*
+    (deny file-read* file-write*
       (subpath (param "HOME_AWS_DIR"))
       (subpath (param "AGENT_DIR")))
     ```
@@ -77,9 +82,10 @@ to `~/.aws/` and `~/.agent-aws/`:
 
 === "Linux"
 
-    `bwrap` (bubblewrap) with `--bind $HOME $HOME` plus `--tmpfs ~/.aws
-    --tmpfs ~/.agent-aws`. The agent literally sees those directories as
-    empty — there is nothing to read.
+    `bwrap` (bubblewrap) hides credential directories behind empty read-only
+    mounts and makes startup files read-only. A private home-directory skeleton
+    prevents missing startup files from being planted persistently. Existing
+    project directories remain writable; see [platform support](platform-support.md).
 
     Also `--unshare-pid --unshare-ipc --unshare-uts`: the agent is PID 1 in
     its own namespace and can't enumerate host processes that might be
@@ -124,6 +130,12 @@ IAM `AccessDenied`.
 ## Out of scope
 
 These are real risks `agent-aws` does *not* address:
+
+- **Found credentials and local services.** Network access remains open.
+  Credentials in project files, metadata services, and reachable unsandboxed
+  daemons are not blocked by step 1. The broker and egress lock are separate work.
+- **Session renewal.** Credentials are still static for a run. The planned
+  broker will renew them; this change does not extend their lifetime.
 
 - **Data-plane reads.** AWS's managed `ReadOnlyAccess` policy grants
   `s3:Get*`, `dynamodb:GetItem`, etc. If your account has PII or customer

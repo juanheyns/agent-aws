@@ -4,7 +4,7 @@
 Layered design:
   1. agent-aws init bootstraps ~/.agent-aws/config.json with one or more
      read-only profiles selected from ~/.aws/config. Admin-equivalent role
-     names are rejected at init time.
+     names are rejected at init and on every run.
   2. agent-aws run mints short-lived STS creds for each configured profile,
      writes them to a per-invocation tempdir, and execs the requested
      command inside sandbox-exec. The sandbox denies file-read* on ~/.aws/,
@@ -17,6 +17,7 @@ import configparser
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SANDBOX_PROFILE = SCRIPT_DIR.parent / "share" / "agent-aws" / "agent-aws.sb"
 
 ADMIN_BLOCKLIST = ("admin", "poweruser", "fullaccess")
+DEFAULT_ALLOWED_ROLES = ("ai-agent", "ReadOnlyAccess")
+STARTUP_PATHS = (
+    ".zshrc", ".zprofile", ".zshenv", ".bashrc", ".bash_profile", ".profile",
+    "Library/LaunchAgents", ".config/brnr",
+)
+INSTALL_DIR = SCRIPT_DIR.parent
 
 IS_MACOS = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
@@ -54,15 +61,71 @@ def is_admin_role(role):
 
 
 def load_config():
-    if not AGENT_CONFIG.exists():
+    # Check the opened inode, not a prior stat of a replaceable pathname.
+    try:
+        fd = os.open(AGENT_CONFIG, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd) as f:
+            info = os.fstat(f.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                die(f"config must be a regular file: {AGENT_CONFIG}")
+            if info.st_uid != os.getuid():
+                die(f"config must be owned by the current user: {AGENT_CONFIG}")
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                die(f"config must have mode 0600: {AGENT_CONFIG}")
+            raw = json.load(f)
+    except FileNotFoundError:
         die(f"no config at {AGENT_CONFIG} — run `agent-aws init` first")
-    raw = json.loads(AGENT_CONFIG.read_text())
+    except (OSError, ValueError) as exc:
+        die(f"cannot read config (symlinks are forbidden): {exc}")
     # In-memory migration: pre-multi-profile schema had account_id at the top
     # level. Wrap it as a single profile named "default" so the rest of the
     # code path is uniform. The on-disk file is rewritten on next `init`.
     if "profiles" not in raw and "account_id" in raw:
-        raw = {"default_profile": "default", "profiles": {"default": raw}}
+        raw = {"default_profile": "default", "profiles": {"default": raw},
+               "allowed_roles": raw.get("allowed_roles", list(DEFAULT_ALLOWED_ROLES))}
     return raw
+
+
+def validate_roles(cfg):
+    allowed = cfg.get("allowed_roles", list(DEFAULT_ALLOWED_ROLES))
+    if not isinstance(allowed, list) or not all(isinstance(r, str) and r for r in allowed):
+        die("allowed_roles must be a list of non-empty role names")
+    for name, profile in cfg["profiles"].items():
+        role = profile.get("role_name")
+        if not isinstance(role, str) or not role:
+            die(f"profile '{name}' has no valid role_name")
+        if is_admin_role(role):
+            die(f"refusing admin-equivalent role '{role}' for profile '{name}'")
+        if role not in allowed:
+            die(f"role '{role}' for profile '{name}' is not in allowed_roles; "
+                "use `agent-aws init --role NAME` to approve a custom read-only role")
+
+
+def preferred_role(src, sessions, profiles, tokens):
+    """Prefer ai-agent when configured locally or returned by SSO; never log in."""
+    session = sessions.get(src.get("sso_session"), {})
+    account = src.get("sso_account_id")
+    if any(p.get("sso_account_id") == account
+           and p.get("sso_session") == src.get("sso_session")
+           and p.get("sso_role_name") == "ai-agent" for p in profiles.values()):
+        return "ai-agent"
+    token = tokens.get(session.get("sso_start_url"))
+    if token:
+        result = subprocess.run([
+            "aws", "sso", "list-account-roles", "--account-id", account,
+            "--access-token", token, "--region", session["sso_region"],
+            "--output", "json",
+        ], capture_output=True, text=True)
+        if result.returncode:
+            die("cannot discover account roles; use --role to select explicitly "
+                "(no login was attempted)")
+        if any(r.get("roleName") == "ai-agent"
+               for r in json.loads(result.stdout).get("roleList", [])):
+            return "ai-agent"
+    else:
+        print("agent-aws: no cached SSO token for role discovery; "
+              "using the locally configured role", file=sys.stderr)
+    return src.get("sso_role_name")
 
 
 def parse_aws_config():
@@ -146,7 +209,14 @@ def cmd_init(args):
     else:
         chosen = interactive_select(eligible)
 
-    new_profiles = {n: derive_profile_entry(n, eligible[n], sessions) for n in chosen}
+    if args.role and is_admin_role(args.role):
+        die(f"refusing admin-equivalent role '{args.role}'")
+    tokens = find_sso_tokens() if not args.role else {}
+    new_profiles = {}
+    for name in chosen:
+        src = dict(eligible[name])
+        src["sso_role_name"] = args.role or preferred_role(src, sessions, profiles, tokens)
+        new_profiles[name] = derive_profile_entry(name, src, sessions)
 
     if args.default:
         if args.default not in new_profiles:
@@ -157,10 +227,23 @@ def cmd_init(args):
         if len(chosen) > 1:
             print(f"agent-aws: using '{default}' as default profile (override with --default)", file=sys.stderr)
 
-    cfg = {"default_profile": default, "profiles": new_profiles}
+    allowed = list(DEFAULT_ALLOWED_ROLES)
+    if args.role and args.role not in allowed:
+        allowed.append(args.role)
+    cfg = {"default_profile": default, "allowed_roles": allowed, "profiles": new_profiles}
+    validate_roles(cfg)
     AGENT_DIR.mkdir(mode=0o700, exist_ok=True)
-    AGENT_CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
-    AGENT_CONFIG.chmod(0o600)
+    # Atomic replacement never follows an existing config symlink and never
+    # leaves a partially written or world-readable config behind.
+    fd, tmp = tempfile.mkstemp(prefix=".config.", dir=AGENT_DIR)
+    try:
+        with os.fdopen(fd, "w") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(json.dumps(cfg, indent=2) + "\n")
+        os.replace(tmp, AGENT_CONFIG)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
     print(f"wrote {AGENT_CONFIG}")
     print(f"  default: {default}")
@@ -252,20 +335,58 @@ def check_sandbox_tool():
 
 
 def build_sandbox_argv_darwin(creds_dir):
-    return [
+    argv = [
         "sandbox-exec",
-        "-D", f"HOME_AWS_DIR={AWS_DIR}",
-        "-D", f"AGENT_DIR={AGENT_DIR}",
-        "-f", str(SANDBOX_PROFILE),
+        "-D", f"HOME={HOME.resolve()}",
+        "-D", f"CREDS_DIR={creds_dir.resolve()}",
+        "-D", f"AGENT_AWS_INSTALL_DIR={INSTALL_DIR.resolve()}",
+        "-D", f"HOME_AWS_DIR={AWS_DIR.resolve()}",
+        "-D", f"AGENT_DIR={AGENT_DIR.resolve()}",
     ]
+    # Protect symlink targets as well as the conventional startup paths.
+    for index, path in enumerate(STARTUP_PATHS):
+        argv += ["-D", f"STARTUP_{index}={(HOME / path).resolve()}"]
+    return argv + ["-f", str(SANDBOX_PROFILE)]
+
+
+def linux_home_mounts():
+    # A private directory skeleton lets absent startup paths be created only
+    # inside the sandbox. A plain rw home + ro-bind-try would let a missing rc
+    # file be planted on the host. Existing ordinary children remain writable.
+    argv = []
+    protected = {HOME / path for path in STARTUP_PATHS}
+    private = {AWS_DIR, AGENT_DIR}
+    containers = {HOME, HOME / ".config", HOME / "Library"}
+
+    def mirror(directory):
+        argv.extend(["--tmpfs", str(directory)])
+        if not directory.exists():
+            return
+        for child in sorted(directory.iterdir()):
+            if child in private:
+                continue
+            if child in containers:
+                mirror(child)
+            elif child in protected:
+                argv.extend(["--ro-bind", str(child.resolve()), str(child)])
+            elif child.is_symlink():
+                argv.extend(["--symlink", os.readlink(child), str(child)])
+            else:
+                argv.extend(["--bind", str(child), str(child)])
+
+    mirror(HOME)
+    for path in sorted(private | {p.resolve() for p in private}):
+        argv += ["--tmpfs", str(path), "--remount-ro", str(path)]
+    # Direct access to dotfile symlink targets must also be read-only.
+    for path in sorted(protected):
+        if path.exists() and path.is_symlink():
+            argv += ["--ro-bind", str(path.resolve()), str(path.resolve())]
+    return argv
 
 
 def build_sandbox_argv_linux(creds_dir):
-    home = str(HOME)
     return [
         "bwrap",
-        # Read-only system mounts. -try variants don't fail if the path is
-        # absent (e.g. /lib64 on some distros, /sbin where it symlinks).
         "--ro-bind", "/usr", "/usr",
         "--ro-bind", "/etc", "/etc",
         "--ro-bind-try", "/bin", "/bin",
@@ -273,19 +394,12 @@ def build_sandbox_argv_linux(creds_dir):
         "--ro-bind-try", "/lib", "/lib",
         "--ro-bind-try", "/lib64", "/lib64",
         "--ro-bind-try", "/opt", "/opt",
-        # Pseudo-filesystems
         "--proc", "/proc",
         "--dev", "/dev",
         "--tmpfs", "/tmp",
-        # Per-run creds dir (writable inside, same path inside as outside)
+        *linux_home_mounts(),
         "--bind", str(creds_dir), str(creds_dir),
-        # Home dir, with credential dirs overlaid by empty tmpfs so the agent
-        # sees nothing in either ~/.aws or ~/.agent-aws — the sandbox mirror
-        # of the macOS profile's `(deny file-read* (subpath ...))` rules.
-        "--bind", home, home,
-        "--tmpfs", str(AWS_DIR),
-        "--tmpfs", str(AGENT_DIR),
-        # Hygiene + isolation
+        "--ro-bind", str(INSTALL_DIR), str(INSTALL_DIR),
         "--die-with-parent",
         "--unshare-pid",
         "--unshare-ipc",
@@ -304,11 +418,14 @@ def build_sandbox_argv(creds_dir):
 
 
 def cmd_run(args):
+    if args.cmd and args.cmd[0] == "--":
+        args.cmd = args.cmd[1:]
     if not args.cmd:
         die("usage: agent-aws run [--profile NAME] -- <command> [args...]")
     check_sandbox_tool()
 
     cfg = load_config()
+    validate_roles(cfg)  # Validate all profiles, even when --profile selects only one.
     profiles = cfg["profiles"]
     if not profiles:
         die("no profiles configured — run `agent-aws init`")
@@ -432,6 +549,7 @@ def main():
                         help="source profile name (repeatable)")
     p_init.add_argument("--all", action="store_true",
                         help="include every non-admin profile in ~/.aws/config")
+    p_init.add_argument("--role", help="explicit read-only role for all selected profiles")
     p_init.add_argument("--default", help="profile to mark as default")
     p_init.set_defaults(func=cmd_init)
 

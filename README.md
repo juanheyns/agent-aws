@@ -22,8 +22,9 @@ profile entirely. So the agent must be sandboxed *away from* that file.
 
 1. **Scoped config.** `agent-aws init` writes `~/.agent-aws/config.json`
    derived from a profile in `~/.aws/config`, hardcoding a non-admin role
-   name (default `ReadOnlyAccess`). Init refuses to write a config naming
-   any admin-equivalent role.
+   name (preferring `ai-agent` when available). Init and every run check
+   the admin blocklist and `allowed_roles`; config must be owned by the user,
+   mode `0600`, and not a symlink.
 
 2. **Cred minting outside the sandbox.** `agent-aws run` reads the
    developer's normal SSO token, calls `sso:GetRoleCredentials` for the
@@ -36,9 +37,11 @@ profile entirely. So the agent must be sandboxed *away from* that file.
    open before any AWS API call can happen.
 
    * **macOS:** `sandbox-exec` with the profile in `share/agent-aws.sb` —
-     `(deny file-read* (subpath ~/.aws) (subpath ~/.agent-aws))`.
-   * **Linux:** `bwrap` (bubblewrap) with `--bind $HOME $HOME --tmpfs ~/.aws
-     --tmpfs ~/.agent-aws` — the agent sees those directories as empty.
+     denies reads and writes to credential directories, writes to startup
+     files, and Launch Services escape paths.
+   * **Linux:** `bwrap` (bubblewrap) hides credential directories behind empty
+     read-only mounts and protects startup files. Existing project directories
+     remain writable; new HOME-level entries are private to the run.
      Plus `--unshare-pid/ipc/uts` for stronger process isolation than
      macOS provides.
 
@@ -88,9 +91,13 @@ Inside the sandbox:
 * `~/.aws/` is unreadable. So is the cached SSO token.
 * Each profile's credentials are minted via `sso:GetRoleCredentials` for
   the configured ReadOnly role only — admin role names are rejected at
-  init time.
+  init and on every run.
 
 ## What this does *not* protect against
+
+* **Found keys and local services.** Network access remains open. Credentials
+  elsewhere in a project and reachable unsandboxed daemons remain risks until
+  the separate egress-lock step. Credentials also do not yet renew during a run.
 
 * **Data-plane reads.** AWS's managed `ReadOnlyAccess` policy grants
   `s3:Get*`, `dynamodb:GetItem`, etc. If your account has PII or customer

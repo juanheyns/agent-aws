@@ -44,6 +44,25 @@ jobs:
           print(f"ok: {pyproject_version}")
           PY
 
+  sandbox:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Install bubblewrap and enable test namespaces
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Unit and sandbox acceptance tests (fake AWS, scratch HOME)
+        run: python -m unittest discover -s tests -v
+
   docs:
     runs-on: ubuntu-latest
     steps:
