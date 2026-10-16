@@ -378,6 +378,9 @@ def protected_paths():
     if isinstance(user_sites, str):
         user_sites = [user_sites]
     paths.update(Path(path) for path in user_sites)
+    # -I still loads installation-site .pth files. Homebrew can place these
+    # outside sys.prefix, so enumerate them rather than infer their location.
+    paths.update(Path(path) for path in site.getsitepackages())
     paths.update(Path(part or os.curdir).absolute() for part in executable_path().split(os.pathsep))
     # Preserve the lexical launcher path as well as its symlink target.
     paths.update((Path(__file__).absolute(), Path(sys.argv[0]).absolute(),

@@ -200,6 +200,23 @@ class ConfigTests(unittest.TestCase):
             agent.mint_role_creds("fake-token", config()["profiles"]["test"], "/trusted/aws")
         self.assertEqual(run.call_args.args[0][0], "/trusted/aws")
 
+    def test_round3_all_interpreter_site_packages_are_protected(self):
+        protected = agent.protected_paths()
+        for name in agent.site.getsitepackages():
+            for path in (Path(name), Path(name).resolve()):
+                with self.subTest(path=path):
+                    self.assertTrue(any(root == path or root in path.parents for root in protected))
+
+    def test_round3_site_packages_outside_prefix_and_symlink_target(self):
+        external = self.home / "external-site"
+        external.mkdir()
+        link = self.home / "site-link"
+        link.symlink_to(external, target_is_directory=True)
+        with mock.patch.object(agent.site, "getsitepackages", return_value=[str(link)]):
+            protected = agent.protected_paths()
+        self.assertIn(link, protected)
+        self.assertIn(external, protected)
+
 
 if __name__ == "__main__":
     unittest.main()

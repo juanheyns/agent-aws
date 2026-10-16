@@ -380,6 +380,63 @@ sys.exit(0 if rc == 0 else 1)
         finally:
             self.env["PATH"] = old_path
 
+    def test_round3_installation_site_pth_in_scratch_venv(self):
+        venv = self.home / "project/site-venv"
+        subprocess.run([sys.executable, "-I", "-m", "venv", "--without-pip", str(venv)],
+                       env=self.env, capture_output=True, text=True, check=True)
+        python = venv / "bin/python"
+        probe = subprocess.run([str(python), "-I", "-c",
+                                "import json, site; print(json.dumps(site.getsitepackages()))"],
+                               env=self.env, capture_output=True, text=True, check=True)
+        sites = [Path(name) for name in json.loads(probe.stdout)]
+        self.assertTrue(sites)
+        # Model Homebrew's external site directory without touching Homebrew:
+        # replace only an empty scratch venv site with a link outside its prefix.
+        site_dir = sites[0]
+        self.assertIn(venv, site_dir.resolve().parents)
+        external = self.home / "project/external-installation-site"
+        external.mkdir()
+        site_dir.rmdir()
+        site_dir.symlink_to(external, target_is_directory=True)
+        pth = external / "zz-agent-aws-test.pth"
+        marker = self.home / "project/installation-pth-ran"
+        payload = f"import pathlib; pathlib.Path({str(marker)!r}).write_text('executed')\n"
+        old_base = self.base
+        try:
+            # Positive control: -I alone does execute installation-site .pth.
+            pth.write_text(payload)
+            subprocess.run([str(python), "-I", "-c", "pass"], env=self.env, check=True)
+            self.assertEqual(marker.read_text(), "executed")
+            pth.unlink()
+            marker.unlink()
+
+            # Load the real module under this interpreter and verify all site
+            # paths and resolved aliases, including the target outside prefix.
+            coverage = r'''import importlib.machinery, importlib.util, pathlib, site, sys
+loader = importlib.machinery.SourceFileLoader("agent_aws", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+protected = module.protected_paths()
+for name in site.getsitepackages():
+    for path in (pathlib.Path(name), pathlib.Path(name).resolve()):
+        assert any(root == path or root in path.parents for root in protected), str(path)
+'''
+            subprocess.run([str(python), "-I", "-c", coverage, str(ROOT / "bin/agent-aws")],
+                           env=self.env, capture_output=True, text=True, check=True)
+            self.__class__.base = [str(python), "-I", str(ROOT / "bin/agent-aws"),
+                                   "run", "--", "/bin/sh", "-c"]
+            for path in (site_dir / pth.name, pth):
+                self.denied(f"printf %s {shlex.quote(payload)} > {shlex.quote(str(path))}")
+                self.assertFalse(pth.exists())
+            next_run = self.run_shell('test "$AGENT_AWS_ACTIVE" = 1')
+            self.assertEqual(next_run.returncode, 0, next_run.stderr)
+            self.assertFalse(marker.exists())
+        finally:
+            self.__class__.base = old_base
+            pth.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     unittest.main()

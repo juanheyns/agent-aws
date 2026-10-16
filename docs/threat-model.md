@@ -76,7 +76,13 @@ startup environment variables cannot run before the wrapper. The interpreter's
 user site-packages directory, resolved target, and ancestors are also protected
 against sandbox writes. When invoking the script through Python explicitly,
 use `python3 -I bin/agent-aws`; flags in a shebang do not apply to such calls.
-System/installation site-packages remain part of the trusted Python installation.
+Python still executes installation-site `.pth` files in isolated mode.
+Every directory returned by `site.getsitepackages()`, its resolved target, and
+its ancestors are therefore write-protected, including Homebrew locations
+outside `sys.prefix`. The pre-existing installation remains trusted. An AWS
+CLI script using a different Python interpreter may load additional site
+paths; this separate-interpreter case is tracked in
+[issue #4](https://github.com/juanheyns/agent-aws/issues/4).
 
 ### 3. Filesystem sandbox
 

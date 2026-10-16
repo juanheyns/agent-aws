@@ -113,6 +113,9 @@ The cred-minting code path is platform-agnostic and won't need to change.
 
 Launchers use Python isolated mode (`-I`), and the interpreter's user
 site-packages directory is write-protected to prevent `.pth` startup injection.
+Installation-site directories reported by `site.getsitepackages()` are also
+protected, even outside the interpreter prefix and through symlink targets:
+`-I` still executes `.pth` files from those directories.
 All launch-PATH directories are read-only: self-updates and global package
 installs into those directories must run outside the sandbox. Empty or `.`
 PATH entries also protect the current directory and produce a warning; use
