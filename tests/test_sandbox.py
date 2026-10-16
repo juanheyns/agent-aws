@@ -210,14 +210,28 @@ sys.exit(0 if rc == 0 else 1)
         for parent in (".config", "Library"):
             original = self.home / parent
             moved = self.home / "project/moved-parent"
+            relative = "brnr/config.toml" if parent == ".config" else "LaunchAgents/probe.plist"
+            sentinel = original / relative
+            sentinel.write_text("sentinel")
             result = self.run_shell(f'mv "$HOME/{parent}" "{moved}"')
             try:
                 self.assertNotEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(original.exists())
-                self.assertFalse(moved.exists())
+                if sys.platform == "darwin":
+                    self.assertFalse(moved.exists())
+                elif moved.exists():
+                    # GNU mv may copy across mount points before it fails to
+                    # remove the protected source. Restoring that modified
+                    # copy must still fail to replace the host mount point.
+                    (moved / relative).write_text("injected")
+                    restore = self.run_shell(f'mv -T "{moved}" "{original}"')
+                    self.assertNotEqual(restore.returncode, 0)
+                self.assertEqual(sentinel.read_text(), "sentinel")
             finally:
                 if moved.exists() and not original.exists():
                     moved.rename(original)
+                elif moved.exists():
+                    shutil.rmtree(moved)
         dotfiles = self.home / "dotfiles"
         dotfiles.mkdir(exist_ok=True)
         target = dotfiles / "zshrc"
