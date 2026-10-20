@@ -290,12 +290,15 @@ sys.exit(0 if rc == 0 else 1)
             self.assert_unchanged(protected)
             # Positive controls: git still reads the included config, and
             # files that the git config does not refer to stay writable.
-            result = self.run_shell("git config --global --get user.name && "
+            # (--global alone does not follow includes.)
+            result = self.run_shell("git config --global --includes --get user.name && "
+                                    "git config --global --get core.hooksPath && "
                                     "echo ok >> ~/dotfiles/unrelated && "
                                     "echo ok >> ~/tools/unrelated && "
                                     "echo 'host ssh-ed25519 AAAA' >> ~/.ssh/known_hosts")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("Included User", result.stdout)
+            self.assertIn("~/.githooks", result.stdout)
             for name in writable:
                 self.assertIn("ok" if "unrelated" in name else "host ssh-ed25519",
                               (home / name).read_text(), name)

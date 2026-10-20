@@ -199,6 +199,10 @@ list of known paths. It does not block it in general.
 - Git and SSH configuration: `~/.gitconfig`, `~/.config/git`, `~/.ssh/config`,
   `~/.ssh/rc`, `~/.ssh/authorized_keys`, `~/.ssh/authorized_keys2`. Agents can
   still read them, run git, and append to `~/.ssh/known_hosts`.
+- Files and programs that this git and SSH configuration refers to: include
+  targets, the `core.hooksPath` directory, helper programs given as absolute
+  or `~` paths, and `$XDG_CONFIG_HOME/git` and `$GIT_CONFIG_GLOBAL`. See
+  [git and SSH config targets](#git-and-ssh-config-targets).
 - Claude Code settings and hooks: `~/.claude/settings.json` and
   `~/.claude/settings.local.json`. Claude Code session state
   (`~/.claude/projects` and similar) stays writable. Settings changes made
@@ -215,6 +219,90 @@ list of known paths. It does not block it in general.
 Missing paths in this list cannot be created: macOS denies the write, and on
 Linux the new file is private to the run.
 
+### Git and SSH config targets
+
+Before the sandbox starts, and outside it, agent-aws finds the files and
+programs that the global git config and `~/.ssh/config` refer to, and protects
+them ([#6](https://github.com/juanheyns/agent-aws/issues/6)). A target that
+does not exist yet is protected too, so a run cannot create it. HOME and its
+ancestors are never protected. A target outside HOME follows the same rules as
+the other protected paths: on macOS writes to it are denied; on Linux it is
+read-only when it is in a read-only system mount, and not visible in the run
+otherwise.
+
+**Git.** agent-aws runs the `git` that it finds in the launch PATH. It uses a
+minimal environment (HOME, PATH, `GIT_CONFIG_NOSYSTEM=1`, no pager, no
+prompt), an empty working directory outside any repository, and a 10-second
+timeout. `git config --list` only reads config. It does not run helpers,
+pagers or hooks (a unit test checks this).
+
+- The start files are `~/.gitconfig`, `~/.config/git/config`, and also
+  `$XDG_CONFIG_HOME/git/config` and `$GIT_CONFIG_GLOBAL` when these are set in
+  the environment of `agent-aws`. The `$XDG_CONFIG_HOME/git` directory and the
+  `$GIT_CONFIG_GLOBAL` file are protected.
+- Each file is read separately with `--no-includes`. Every `include.path` and
+  `includeIf.*.path` is followed, whatever its condition, up to git's include
+  depth of 10. `git config --global --list --show-origin --includes` adds the
+  files that git itself includes.
+- Protected from these files:
+    - every included file. `~` is expanded. A relative path is relative to the
+      directory of the including file (its lexical and its resolved path).
+    - the `core.hooksPath` directory, when it is absolute or starts with `~`.
+    - the program of a command when its first word is an absolute or `~` path
+      (after a `!` and a leading `exec`): `credential.helper` (also per URL),
+      `core.fsmonitor`, `core.sshCommand`, `core.pager`, `core.editor`,
+      `core.askPass`, `core.gitProxy`, `sequence.editor`, `gpg.program` and
+      `gpg.*.program`, `diff.external`, `diff.*.textconv`, `diff.*.command`,
+      `filter.*.clean`, `filter.*.smudge`, `filter.*.process`,
+      `merge.*.driver`, `cmd` and `path` of `mergetool.*`, `difftool.*`,
+      `man.*` and `browser.*`, `sendemail.smtpServer`,
+      `uploadpack.packObjectsHook`, `pager.*` and `alias.*`.
+- If git is not in PATH, or a git call fails or times out, the run continues
+  and prints a warning. The targets of that config are then not protected.
+
+**SSH (partial parse).** agent-aws does not run `ssh -G`, because it
+evaluates `Match exec`, which runs commands. agent-aws reads `~/.ssh/config`
+itself:
+
+- What is parsed: `Include` lines in any `Host` or `Match` block, recursively up
+  to ssh's depth of 16. `~` is expanded, and a relative path is relative to
+  `~/.ssh`. For a glob, agent-aws protects the matched files and the directory
+  above the first glob part, so that a new match cannot be planted. The
+  exception is `~/.ssh` itself (`known_hosts` must stay writable). Also parsed:
+  the first word of `ProxyCommand`, `LocalCommand`, `KnownHostsCommand` and
+  `Match [!]exec` when it is an absolute or `~` path (a leading `exec` is
+  skipped), and the `PKCS11Provider` and `SecurityKeyProvider` libraries.
+- What is not parsed: `/etc/ssh/ssh_config` and its includes, files given with
+  `ssh -F`, `%` tokens and `${VAR}` in paths, other keywords (for example
+  `IdentityAgent` or `UserKnownHostsFile`), and lines that `shlex` cannot split.
+
+**Not protected.** A command that is a shell string (`!sh -c '…'`,
+`ProxyCommand sh -c …`, a shell function, a variable) cannot be resolved in
+general. Only its first word is checked, and a bare name resolves through the
+protected PATH. These are also not protected: a relative `core.hooksPath`
+(git resolves it in each repository), the system git config and its includes,
+`%(prefix)/` include paths, repository config
+([#7](https://github.com/juanheyns/agent-aws/issues/7)), and, on macOS, a new
+file that matches a glob `Include` directly in `~/.ssh` (on Linux, `~/.ssh` is
+a private skeleton, so the new file disappears after the run).
+
+#### What normal use now breaks inside a run
+
+- You cannot edit an included git config file, a script in the
+  `core.hooksPath` directory, or a helper program that the config names. Also,
+  `git config --file <include target> …` fails, and a new hook cannot be added.
+  Make these changes outside the sandbox.
+- A dotfiles repository that holds an include target or a helper: that file
+  is read-only in a run, so a `git pull` or `checkout` there that changes it
+  fails. On Linux, the directory that holds a target becomes a private
+  skeleton: existing entries stay writable, but new top-level entries there
+  disappear when the run ends.
+- A global `core.hooksPath` or a helper path inside a project makes that path
+  read-only in the run. On Linux the project directory then becomes a private
+  skeleton too: new top-level entries in it disappear when the run ends.
+- New files cannot be added to a directory that a glob `Include` reads, for
+  example `~/.ssh/config.d`.
+
 ### Not protected
 
 The [#4 assessment](https://github.com/juanheyns/agent-aws/pull/5) confirmed
@@ -223,7 +311,7 @@ with disposable fixtures that a run can still write these. Each one is tracked:
 | Class | Example that stays writable | Issue |
 |---|---|---|
 | Install targets of symlinked PATH executables | `~/.local/share/claude/versions/*` behind `~/.local/bin/claude` | [#13](https://github.com/juanheyns/agent-aws/issues/13) |
-| Git/SSH include targets and helper programs | `include.path` targets, `core.hooksPath` scripts | [#6](https://github.com/juanheyns/agent-aws/issues/6) |
+| Git/SSH commands that are shell strings, and config that agent-aws does not parse | `!sh -c '…'` aliases, `ProxyCommand sh -c …`, a relative `core.hooksPath`, system git config, `/etc/ssh/ssh_config`, ssh `${VAR}` paths | [#6](https://github.com/juanheyns/agent-aws/issues/6) (decision: not resolvable in general; see [git and SSH config targets](#git-and-ssh-config-targets)) |
 | Repository-local configuration | `.git/config` (`core.fsmonitor`), `.git/hooks`, project `.claude/settings.json`, `.envrc` | [#7](https://github.com/juanheyns/agent-aws/issues/7) |
 | Agent config that the agent writes itself | `~/.claude.json` (`mcpServers`), `~/.claude/plugins`, `~/.claude/CLAUDE.md`, `~/.codex/config.toml` | [#8](https://github.com/juanheyns/agent-aws/issues/8) |
 | Code sourced by startup files, other shells, tool config, other bin dirs | `~/.oh-my-zsh/custom`, `~/.config/fish`, `~/.npmrc`, `~/bin` not in PATH | [#9](https://github.com/juanheyns/agent-aws/issues/9) |
