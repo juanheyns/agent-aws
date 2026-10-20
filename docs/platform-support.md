@@ -33,12 +33,21 @@ startup files (`.zshrc`, `.zprofile`, `.zshenv`, `.zlogin`, `.zlogout`,
 `~/.claude/settings.local.json`), and the resolved installation directory are
 denied. Generated rules protect conventional paths, resolved targets, and every
 ancestor against rename. Launch PATH directories, launcher paths, the
-Python/AWS CLI installation prefixes (including the interpreter of a Python
-`aws` script), and Homebrew prefixes except `var/` are protected too.
+Python/AWS CLI installation prefixes (including the interpreter and venv of
+a Python `aws` script; other `aws` wrappers are not followed, see
+[#12](https://github.com/juanheyns/agent-aws/issues/12)), and Homebrew
+prefixes except `var/` are protected too.
 Other runs' files are unreadable and unwritable; limited pathname metadata
 is allowed so shell globs report denied files rather than silently skipping them.
 `open`, `osascript`, `launchctl`, mounts, and the Launch Services / quarantine
 Mach services named in the sandbox profile are denied.
+
+Because ancestors of protected paths are denied as literals (against
+rename-in), **a missing `~/.ssh` or `~/.claude` cannot be created inside a
+run**. On a fresh account, the first `ssh` (which creates `~/.ssh/known_hosts`)
+or the first `claude` (which creates `~/.claude/projects`) fails in the
+sandbox. Run `ssh` and `claude` once outside the sandbox first. After that,
+`known_hosts` and `~/.claude/projects` stay writable.
 
 `sandbox-exec` is technically deprecated by Apple but has shown no signs of
 removal in years; Apple uses it themselves for App Sandbox. If it ever does

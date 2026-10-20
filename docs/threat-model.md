@@ -85,8 +85,18 @@ outside `sys.prefix`. The pre-existing installation remains trusted. When the
 resolved `aws` is a Python script for a different interpreter (for example
 `pip install --user awscli`), the wrapper asks that interpreter (`-I -S`) for
 its prefixes, site-packages and user site and protects them too. If it cannot
-answer, the run fails closed. `aws` wrappers that are not Python scripts (asdf
-or mise shims, shell scripts) are not followed
+answer, the run fails closed. The interpreter is read from a direct shebang,
+from `env` (with `-i`, `-u`, `-S`, `-P` and `NAME=VALUE`), or from the
+pip/distlib `#!/bin/sh` + `'''exec' <python>` launcher; `python*` and `pypy*`
+names are followed. Before Python 3.11, `-I -S` reports the base install for
+a venv interpreter, so the venv root (the interpreter's `../..` when a
+`pyvenv.cfg` is next to it or one level up, for the lexical and the resolved
+path) is protected as well, and `pyvenv.cfg` cannot be created there. This
+covers an `aws` wrapper outside the venv whose shebang names the venv's
+Python. HOME and its ancestors are never protected as a whole.
+`aws` wrappers that are not Python scripts (asdf or mise shims, shell scripts)
+and shebangs that cannot be parsed are not followed; for a Python-like
+shebang that cannot be parsed, agent-aws prints a warning
 ([#12](https://github.com/juanheyns/agent-aws/issues/12)).
 
 Homebrew prefixes are user-writable. PATH symlinks such as
@@ -196,7 +206,8 @@ list of known paths. It does not block it in general.
 - Executables and code that the wrapper or a later shell runs: every
   launch-PATH directory, the agent-aws installation and launcher, the Python
   interpreter, its site-packages and user site, the `aws` and `python3`
-  installation prefixes, the interpreter paths of a Python `aws` script, and
+  installation prefixes, the interpreter paths of a Python `aws` script
+  (including the venv of a venv interpreter), and
   each Homebrew prefix except `var/`.
 - For each path: its resolved symlink target. On macOS every ancestor is also
   protected against rename.
@@ -218,7 +229,7 @@ with disposable fixtures that a run can still write these. Each one is tracked:
 | Code sourced by startup files, other shells, tool config, other bin dirs | `~/.oh-my-zsh/custom`, `~/.config/fish`, `~/.npmrc`, `~/bin` not in PATH | [#9](https://github.com/juanheyns/agent-aws/issues/9) |
 | Mutable dependencies outside protected trees | Homebrew `var/`, new prefix entries, nvm, uv, conda, mise | [#10](https://github.com/juanheyns/agent-aws/issues/10) |
 | macOS services that write for the caller, app autostart | cfprefsd (Terminal/iTerm2 startup command), Login Items, launchd jobs, iTerm2 AutoLaunch | [#11](https://github.com/juanheyns/agent-aws/issues/11) |
-| `aws` wrappers that are not Python scripts | asdf/mise shims, shell wrappers | [#12](https://github.com/juanheyns/agent-aws/issues/12) |
+| `aws` wrappers that are not Python scripts, shebangs that cannot be parsed | asdf/mise shims, shell wrappers, `#!python3` (relative) | [#12](https://github.com/juanheyns/agent-aws/issues/12) |
 
 The working tree is output of an untrusted process. Review it before you run
 git, build tools, or an agent in it outside the sandbox. A later unsandboxed
