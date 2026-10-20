@@ -809,6 +809,46 @@ print(json.dumps({"roleCredentials": {"accessKeyId": "EVIL-KEY",
         finally:
             shutil.rmtree(work)
 
+    def test_pr25_link_to_tree_ancestor_on_command_chain(self):
+        # PR #25 review 2, finding 4: cwd `~/src/proj` (with `.git`),
+        # `~/.local/bin/tool -> ~/d/l/tools/bin/tool` and `~/d/l -> ~/src`.
+        # Run 1 must not repoint `~/d/l` to `~/evil`; the next unsandboxed
+        # `tool` still runs the original.
+        work = self.home / "pr25-tree-link"
+        home = self.scratch_home(work)
+        fake = '#!/bin/sh\necho TOOL-{}\nif [ $# -gt 0 ]; then exec /bin/sh "$@"; fi\n'
+        for path, text in ((home / "src/tools/bin/tool", fake.format("OK")),
+                           (home / "evil/tools/bin/tool", fake.format("EVIL"))):
+            path.parent.mkdir(parents=True)
+            path.write_text(text)
+            path.chmod(0o700)
+        (home / "src/proj/.git").mkdir(parents=True)
+        (home / "d").mkdir()
+        (home / "d/l").symlink_to(home / "src")
+        (home / ".local/bin").mkdir(parents=True)
+        (home / ".local/bin/tool").symlink_to(home / "d/l/tools/bin/tool")
+        env = dict(self.env, HOME=str(home), PATH=f"{home}/.local/bin:{self.home}/bin:" + os.environ["PATH"])
+        cwd = home / "src/proj"
+        try:
+            result = self.run_in(home, env, ["tool", "-c", 'ln -sfn "$HOME/evil" "$HOME/d/l"'], cwd)
+            print(f"PR25 tool -c ln -sfn ~/evil ~/d/l: exit={result.returncode} [{result.stderr.strip()}]",
+                  flush=True)
+            if sys.platform == "darwin":
+                self.assertNotEqual(result.returncode, 0, "~/d/l repointed")
+                self.assertRegex(result.stderr.lower(), "not permitted")
+            self.assertEqual(os.readlink(home / "d/l"), str(home / "src"), "~/d/l repointed on the host")
+            unsandboxed = subprocess.run([str(home / ".local/bin/tool")], env=env, cwd=cwd,
+                                         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+            self.assertEqual(unsandboxed.stdout, "TOOL-OK\n")
+            # Positive control: the working tree below `~/src` is writable.
+            result = self.run_in(home, env, ["tool", "-c", 'echo ok > "$HOME/src/proj/x"'], cwd)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((cwd / "x").read_text(), "ok\n")
+            print("PR25 PASS: ~/d/l unchanged, unsandboxed tool prints TOOL-OK, ~/src/proj writable",
+                  flush=True)
+        finally:
+            shutil.rmtree(work)
+
     def test_issue13_run_command_install_location(self):
         # Issue #13: the run's own command is a symlink in ~/.local/bin into
         # its install location (claude: a versions/ file; codex: a `current`

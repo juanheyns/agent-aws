@@ -89,7 +89,9 @@ HOME is protected too (for example `~/d/h -> ~`, or the root-owned
 `/var -> private/var` on macOS): macOS denies writes to the link path only,
 and Linux mounts a private copy of the link (`--symlink`) in its skeleton
 directory, never its target, so HOME stays writable and a repoint in a run is
-lost when the run ends. More than 40 links on one path fail closed.
+lost when the run ends. Linux does the same for a link to a strict ancestor
+of the working tree, so that the tree stays writable. More than 40 links on
+one path fail closed.
 The developer still supplies a trusted initial PATH and installation; this
 is not a scan of pre-existing executables for malicious content.
 
@@ -460,11 +462,15 @@ protects the link and `~/.local/share/claude`. The Codex standalone install
 `go install` commands (`~/.cargo/bin/<x>`, `~/go/bin/<x>`) protect only
 `~/.cargo/bin` or `~/go/bin`.
 
-A link on the chain is skipped when its target is in the working tree or is
-an ancestor of it (but not HOME or an ancestor of HOME): the run can write in
-the working tree anyway, and on Linux the protected link would mount its
-target, and so the working tree, read-only. A link to HOME or an ancestor of
-HOME is protected, as for `aws` above.
+A link on the chain is skipped only when its target is the working tree or
+is inside it: the run can write there anyway. A link whose target is a
+strict ancestor of the working tree is protected, because the executable
+behind it is outside the tree (`~/d/l -> ~/src` with the tree `~/src/proj`
+and `~/.local/bin/tool -> ~/d/l/tools/bin/tool`). On Linux such a link is a
+private copy (`--symlink`), never a read-only mount of its target, so the
+working tree stays writable and a repoint in a run is lost when the run
+ends. A link to HOME or an ancestor of HOME is protected in the same way, as
+for `aws` above.
 
 Never protected:
 
@@ -486,7 +492,9 @@ Still not protected:
 - A command started through a wrapper: `sh -c 'claude'`, `env X=1 claude`,
   `npx …`, `uvx …`. Only `args[0]` is followed.
 - The interpreter and libraries of a script command (for example the `node`
-  that a `#!/usr/bin/env node` command runs, and its `node_modules`).
+  that a `#!/usr/bin/env node` command runs, and its `node_modules`, or the
+  `~/.local/lib/python*/site-packages` of a `pip install --user` command in
+  `~/.local/bin`).
 - A command inside the working tree: it is output of the run anyway.
 
 ### What normal use now breaks inside a run
@@ -602,7 +610,8 @@ Still not protected:
   `~/d` for `~/d/link`). On Linux a protected directory link is mounted
   read-only from its target, so its target directory is read-only in the run
   too (on macOS only the link is protected). A link to HOME or an ancestor of
-  HOME is the exception: it is a private copy of the link (see above).
+  HOME, or to a strict ancestor of the working tree, is the exception: it is
+  a private copy of the link (see above).
 - You cannot edit fish `config.fish`, `conf.d`, `functions` or `completions`;
   `fisher install`/`update` and `funcsave` fail. `set -U` works on both
   platforms: on Linux, `~/.config/fish` is bound read-write (like `~/.codex`)

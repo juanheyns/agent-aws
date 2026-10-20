@@ -607,18 +607,26 @@ def symlink_chain(path):
     return links
 
 
-def home_link(path):
-    """True if path is a symlink to HOME or an ancestor of HOME. Linux mounts
-    a protected one as a private --symlink, never from its target: that would
-    show the real HOME (with ~/.aws) at the link and bind HOME read-only."""
-    return path.is_symlink() and home_or_ancestor(path.resolve())
+def copied_link(path, trees):
+    """True if path is a symlink to HOME or an ancestor of HOME, or to a strict
+    ancestor of one of trees (working_trees(); `~/d/l -> ~/src` with the tree
+    `~/src/proj`). Linux mounts a protected one as a private --symlink copy
+    (a repoint is lost when the run ends), never from its target: a ro-bind
+    of HOME or above would show the real HOME (with ~/.aws) at the link and
+    make HOME read-only; a ro-bind of a strict ancestor of a tree would make
+    the tree read-only. The copy is never weaker: each protected path behind
+    the link is protected by its own resolved entry."""
+    if not path.is_symlink():
+        return False
+    target = path.resolve()
+    return home_or_ancestor(target) or any(target in tree.parents for tree in trees)
 
 
 def chain_links(executable, excluded, skip_target=None):
     """The symlinks on the chain of executable that are not excluded (#23).
 
     Also a link to HOME or an ancestor of HOME (`~/d/h -> ~`): see
-    home_link(). skip_target: a link whose resolved target it matches is
+    copied_link(). skip_target: a link whose resolved target it matches is
     skipped (the working tree of the run's command). Final paths: callers
     must not resolve them again, so that a link is protected itself, not its
     target (a `/tmp` link must not protect `/private/tmp`).
@@ -670,8 +678,10 @@ def command_paths(program):
     The symlinks on its PATH chain and its prefix, bin dir or executable
     (install_paths()), but never HOME, `/` or another ancestor of HOME, and
     nothing that is a working tree, an ancestor of one or inside one (a
-    `./script` in the project); a link into one is skipped too, unless it
-    points to HOME or an ancestor of HOME. The prefix is never a direct
+    `./script` in the project). A link to or into one is skipped too (the
+    run can write there anyway), but not a link to a strict ancestor of one
+    (`~/d/l -> ~/src`): the executable is outside the tree, and Linux mounts
+    such a link as a copy (copied_link()). The prefix is never a direct
     child of HOME (`~/.local`, `~/.cargo`, `~/go`): a plain file in
     `~/.local/bin` protects that bin dir only. Final paths: do not resolve
     them again.
@@ -681,14 +691,17 @@ def command_paths(program):
         return set()
     trees = working_trees()
 
-    def in_tree(path):
-        return any(path == tree or path in tree.parents or tree in path.parents for tree in trees)
+    def at_or_in_tree(path):
+        return any(path == tree or tree in path.parents for tree in trees)
 
     def excluded(path):
-        return home_or_ancestor(path) or in_tree(path)
+        return (home_or_ancestor(path) or at_or_in_tree(path)
+                or any(path in tree.parents for tree in trees))
 
     def skip_target(path):
-        return in_tree(path) and not home_or_ancestor(path)
+        # Not a link to a strict ancestor of a tree (`~/d/l -> ~/src`): the
+        # executable behind it is outside the tree (PR #25 review 2).
+        return at_or_in_tree(path) and not home_or_ancestor(path)
 
     def skip_prefix(path):
         # path is resolved; HOME as given and resolved.
@@ -1147,6 +1160,7 @@ def linux_home_mounts(protected=None):
     argv = []
     protected = protected_paths() if protected is None else protected
     parent_binds = linux_parent_binds(protected)
+    trees = working_trees()  # the same process and cwd as command_paths()
     private = {AWS_DIR, AGENT_DIR}
     containers = {HOME}
     containers.update(parent for path in protected for parent in path.parents
@@ -1159,7 +1173,7 @@ def linux_home_mounts(protected=None):
         for child in sorted(directory.iterdir()):
             if child in private:
                 continue
-            if child in protected and home_link(child):
+            if child in protected and copied_link(child, trees):
                 # A private copy: a repoint is lost when the run ends.
                 argv.extend(["--symlink", os.readlink(child), str(child)])
             elif child in protected:
@@ -1193,7 +1207,7 @@ def linux_home_mounts(protected=None):
         argv += ["--tmpfs", str(path), "--remount-ro", str(path)]
     # Include targets with symlinked ancestors, not only final-component links.
     for path in sorted(protected - private):
-        if path.exists() and path.resolve() != path and not home_link(path):
+        if path.exists() and path.resolve() != path and not copied_link(path, trees):
             argv += ["--ro-bind", str(path.resolve()), str(path.resolve())]
     return argv
 

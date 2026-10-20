@@ -148,9 +148,10 @@ of `agent-aws`, `aws` and `python3`.
 The reason is in the
 [threat model](threat-model.md#what-normal-use-now-breaks-inside-a-run).
 Symlink targets of protected startup files are also read-only, including targets reached through symlinked ancestors. A
-protected PATH symlink whose target is HOME or an ancestor of HOME is not
-mounted from its target: it is a private copy of the link, so a repoint in a
-run is lost when the run ends. Launch
+protected PATH symlink whose target is HOME or an ancestor of HOME, or a
+strict ancestor of the working tree, is not mounted from its target: it is a
+private copy of the link, so a repoint in a run is lost when the run ends,
+and HOME and the working tree stay writable. Launch
 PATH directories and executable installation paths are protected too. This avoids the missing-file hole in `--ro-bind-try`.
 
 ### Unprivileged user namespaces

@@ -1328,6 +1328,85 @@ class Issue13CommandTests(unittest.TestCase):
                 self.assertIn(home / ".local/share/claude", claude)
                 self.assert_home_and_tree_open(claude)
 
+    def tree_link_fixture(self):
+        # PR #25 review 2, finding 4: cwd `~/src/proj` (with `.git`),
+        # `~/.local/bin/tool -> ~/d/l/tools/bin/tool` and `~/d/l -> ~/src`.
+        # HOME is `<W>/hl/home` with `<W>/hl -> <W>/real`.
+        work = self.home / "pr25-tree-link"
+        real = work / "real/home"
+        (real / "src/proj/.git").mkdir(parents=True)
+        (real / "d").mkdir()
+        (real / ".local/bin").mkdir(parents=True)
+        (work / "hl").symlink_to(work / "real")
+        home = work / "hl/home"
+        tool = real / "src/tools/bin/tool"
+        tool.parent.mkdir(parents=True)
+        tool.write_text("#!/bin/sh\n")
+        tool.chmod(0o700)
+        (real / "d/l").symlink_to(home / "src")
+        (real / ".local/bin/tool").symlink_to(home / "d/l/tools/bin/tool")
+        os.chdir(home / "src/proj")
+        return work, home, real
+
+    def tree_link_paths(self, home):
+        with mock.patch.dict(os.environ, {"PATH": str(home / ".local/bin")}), \
+             mock.patch.multiple(agent, HOME=home, AWS_DIR=home / ".aws", AGENT_DIR=home / ".agent-aws",
+                                 python_paths=mock.Mock(return_value=[])):
+            paths = agent.command_paths("tool")
+            protected = agent.protected_paths(set(), paths)
+            argv = agent.linux_home_mounts(protected)
+        return paths, protected, argv
+
+    def test_pr25_link_to_tree_ancestor_is_protected(self):
+        # The target `~/src` of `~/d/l` is a strict ancestor of the tree, but
+        # the executable behind it is outside the tree: run 1 could repoint
+        # `~/d/l` and the next unsandboxed `tool` would run another file.
+        work, home, real = self.tree_link_fixture()
+        paths, _, _ = self.tree_link_paths(home)
+        self.assertTrue({real / "d/l", home / "d/l"} <= paths, "~/d/l not protected")
+        self.assertTrue({real / "src/tools", home / "src/tools"} <= paths, "~/src/tools not protected")
+        trees = {home / "src/proj", real / "src/proj"}
+        for path in (*trees, home / "src", real / "src", home, real, work / "hl", *work.parents):
+            self.assertNotIn(path, paths, f"{path} protected")
+        for tree in trees:
+            self.assertFalse(any(tree in path.parents for path in paths), f"path inside {tree} protected")
+
+    def test_pr25_link_to_or_into_tree_is_skipped(self):
+        # A link whose target is the tree or inside it stays skipped: the run
+        # can write there anyway.
+        work, home, real = self.tree_link_fixture()
+        (real / "src/proj/bin").mkdir()
+        (real / "src/proj/bin/tool").write_text("#!/bin/sh\n")
+        (real / "src/proj/bin/tool").chmod(0o700)
+        for name, target in (("to", home / "src/proj"), ("into", home / "src/proj/bin")):
+            with self.subTest(link=name):
+                (real / "d/l").unlink(missing_ok=True)
+                (real / "d/l").symlink_to(target)
+                (real / ".local/bin/tool").unlink()
+                (real / ".local/bin/tool").symlink_to(
+                    home / ("d/l/bin/tool" if name == "to" else "d/l/tool"))
+                paths, _, _ = self.tree_link_paths(home)
+                self.assertEqual(paths, set())
+
+    def test_pr25_linux_link_to_tree_ancestor_is_private_symlink(self):
+        # Pure argv check (also on macOS): `~/d/l` is a private copy, never a
+        # --ro-bind of `~/src` (at the link or at `~/src`): the tree stays
+        # writable.
+        work, home, real = self.tree_link_fixture()
+        _, protected, argv = self.tree_link_paths(home)
+        self.assertTrue({real / "d/l", home / "d/l"} <= protected)
+        joined = " ".join(argv) + " "
+        self.assertIn(f"--tmpfs {home}/d ", joined)
+        self.assertIn(f"--symlink {home}/src {home}/d/l ", joined)
+        trees = {home / "src/proj", real / "src/proj"}
+        ro_binds = [(argv[i + 1], argv[i + 2]) for i, arg in enumerate(argv) if arg == "--ro-bind"]
+        for source, destination in ro_binds:
+            for path in (Path(source), Path(destination)):
+                self.assertNotIn(path, {home / "src", real / "src", *trees}, f"--ro-bind {source} {destination}")
+                self.assertNotEqual(path, home / "d/l", f"--ro-bind {source} {destination}")
+        self.assertIn(f"--tmpfs {home}/src ", joined)
+        self.assertIn(f"--bind {home}/src/proj {home}/src/proj ", joined)
+
     def linux_mounts(self, targets):
         home = self.home
         with mock.patch.multiple(agent, AWS_DIR=home / ".aws", AGENT_DIR=home / ".agent-aws"):
