@@ -48,7 +48,10 @@ Python/AWS CLI installation prefixes (including the interpreter and venv of
 a Python `aws` script; other `aws` wrappers are not followed, see
 [#12](https://github.com/juanheyns/agent-aws/issues/12)), and Homebrew
 prefixes except `var/` are protected too. If the `aws` or `python3` prefix
-is HOME or an ancestor of HOME, only the executable's directory is protected.
+is HOME or an ancestor of HOME, only the executable's directory (or only the
+executable, if that directory is HOME or an ancestor too) and `python3`'s own
+install paths are protected; see the
+[threat model](threat-model.md#2-cred-minting-outside-the-sandbox) for details.
 Other runs' files are unreadable and unwritable; limited pathname metadata
 is allowed so shell globs report denied files rather than silently skipping them.
 `open`, `osascript`, `launchctl`, mounts, and the Launch Services / quarantine

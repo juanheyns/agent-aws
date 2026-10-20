@@ -74,8 +74,8 @@ if that directory is itself HOME or an ancestor of HOME, only the executable
 is protected. In that case, `python3`'s own install paths (stdlib,
 site-packages, as its `-I -S` probe reports them, minus HOME and its
 ancestors) are protected too; the other directories of that prefix (for
-`aws`, or non-Python files) are not. HOME is compared both as given and resolved. The agent-aws
-interpreter's own prefix (`sys.prefix`, `sys.base_prefix`) is protected
+`aws`, or non-Python files) are not. HOME is compared both as given and
+resolved. The agent-aws interpreter's own prefix (`sys.prefix`, `sys.base_prefix`) is protected
 without this HOME rule: if that prefix is HOME's parent, HOME stays
 write-denied (fail-safe).
 The developer still supplies a trusted initial PATH and installation; this
