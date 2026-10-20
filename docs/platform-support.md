@@ -104,7 +104,10 @@ and `[includeIf "gitdir:~/work/"]` with `path = ~/work/.gitconfig` makes
 `nvm install` or `npm i -g` in a run are lost. `~/.codex` is not a skeleton:
 it is bound read-write and only its existing `AGENTS.md` and
 `AGENTS.override.md` are bound read-only, so a missing one can be created in a
-run on Linux (macOS denies it). An existing top-level entry in a skeleton directory is a
+run on Linux (macOS denies it). If one of these instruction files is a
+symlink (for example into a dotfiles repo), `~/.codex` stays a skeleton: new
+top-level entries in it are lost when the run ends, and a rename-replace of
+`config.toml` fails. An existing top-level entry in a skeleton directory is a
 bind mount: it cannot be replaced by rename or unlinked. At run start,
 agent-aws prints the skeleton directories that come from git, SSH and agent config targets.
 The reason is in the

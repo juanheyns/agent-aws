@@ -71,7 +71,8 @@ STARTUP_PATHS = (
 # on top. Use it for a directory whose own files the agents replace by rename
 # (~/.codex/config.toml). The directory and each existing protected child are
 # mount points, so neither can be renamed or unlinked. Cost: a missing
-# protected child can be created on the host. See linux_parent_binds().
+# protected child can be created on the host. Not used (skeleton instead)
+# when a protected child is a symlink. See linux_parent_binds().
 LINUX_PARENT_BIND = (".codex",)
 # Asked of the interpreter named by a Python `aws` script. -I -S: no site,
 # user-site or working-directory code runs while answering.
@@ -927,9 +928,12 @@ def linux_parent_binds(protected):
     """LINUX_PARENT_BIND directories that linux_home_mounts() binds read-write.
 
     Only a real directory (not a symlink) whose protected paths below it are
-    all STARTUP_PATHS direct children with no dangling symlink. Any other
-    protected path below it (a config target) keeps the skeleton, so a
-    missing program there cannot be created.
+    all STARTUP_PATHS direct children, none of them a symlink (existing or
+    dangling). Any other protected path below it (a config target) keeps the
+    skeleton, so a missing program there cannot be created. A symlinked child
+    (e.g. into a dotfiles repo) also keeps the skeleton: in a read-write bind
+    its --ro-bind destination would be a host symlink, so bwrap would fail or
+    rm plus a new file would persist on the host.
     """
     startup = {HOME / path for path in STARTUP_PATHS}
     binds = set()
@@ -939,7 +943,7 @@ def linux_parent_binds(protected):
             continue
         below = [path for path in protected if directory in path.parents]
         if all(path in startup and path.parent == directory
-               and (path.exists() or not path.is_symlink()) for path in below):
+               and not path.is_symlink() for path in below):
             binds.add(directory)
     return binds
 

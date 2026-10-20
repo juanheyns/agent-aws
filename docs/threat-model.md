@@ -422,7 +422,16 @@ reads only `~/.claude` and `~/.codex`), and other agents (not surveyed).
   `~/.codex/AGENTS.override.md` can be created in a run and stays on the host
   (macOS denies it). If a config target is below `~/.codex` (for example a
   `notify` program in `~/.codex/bin`), `~/.codex` stays a skeleton, so a
-  missing program there cannot be created. This was not tested with the real
+  missing program there cannot be created. **The parent bind is used only when
+  no protected child is a symlink.** If `~/.codex/AGENTS.md` or
+  `AGENTS.override.md` is a symlink (existing or dangling, for example into a
+  dotfiles repo with GNU stow), `~/.codex` stays a skeleton on Linux and the
+  skeleton costs apply again: new top-level entries in `~/.codex` are lost
+  when the run ends, and a rename-replace of `config.toml` fails (`EBUSY`);
+  in-place writes to `config.toml` still work. The reason: in a read-write
+  bind, the read-only mount destination would be the host symlink, so the run
+  would fail to start, or `rm` plus a new file would persist on the host.
+  This was not tested with the real
   Codex ([#8](https://github.com/juanheyns/agent-aws/issues/8)).
 
 ### Not protected
