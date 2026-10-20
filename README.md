@@ -98,13 +98,16 @@ Inside the sandbox:
 * **Host persistence outside the listed paths.** The sandbox protects known
   startup paths (shell rc files, LaunchAgents, git/SSH and Claude Code
   settings, and the git/SSH include targets, hooks directory and helper
-  programs that this config names) and install trees (PATH directories, the
+  programs that this config names, user-level agent instructions such as
+  `~/.claude/CLAUDE.md`, skills and `~/.codex/AGENTS.md`, and the hook and MCP
+  server programs that the agent config names) and install trees (PATH directories, the
   Python and AWS CLI installs, Homebrew prefixes). An `aws` that is a Python script (also a venv
   wrapper or a pip `/bin/sh` launcher) is followed to its interpreter; other
   `aws` wrappers, such as asdf/mise shims, are not
   ([#12](https://github.com/juanheyns/agent-aws/issues/12)). It is not host
   isolation. For example,
-  `~/.claude.json`, plugin directories, a repo's `.git/config` and programs
+  `~/.claude.json` and `~/.codex/config.toml` themselves, plugin
+  directories, a repo's `.git/config` and programs
   run by git/SSH commands that are shell strings stay writable. See the
   [supported host-isolation boundary](https://juanheyns.github.io/agent-aws/threat-model/#supported-host-isolation-boundary).
   For agents that you do not trust, use a separate OS user or a container/VM.

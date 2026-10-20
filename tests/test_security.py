@@ -767,6 +767,8 @@ class Issue8AgentConfigTests(unittest.TestCase):
             self.assertIn("config.toml", error)
         self.assert_protected(paths, "ok-hook")
         # Wrong types anywhere are skipped without an error.
+        codex = self.home / ".codex/config.toml"
+        codex.write_text('notify = "not a list"\n') if HAS_TOMLLIB else codex.unlink()
         self.write(".claude/settings.json", json.dumps({"hooks": {"Stop": "x", "Pre": [1, {"hooks": "y"}]},
                                                         "statusLine": "z", "apiKeyHelper": 3}))
         self.write(".claude.json", json.dumps({"mcpServers": {"a": 1, "b": {"command": 2}},

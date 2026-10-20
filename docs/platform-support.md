@@ -33,7 +33,12 @@ startup files (`.zshrc`, `.zprofile`, `.zshenv`, `.zlogin`, `.zlogout`,
 configuration refers to (include targets, `core.hooksPath`, helper programs;
 see [git and SSH config targets](threat-model.md#git-and-ssh-config-targets)),
 Claude Code settings (`~/.claude/settings.json`,
-`~/.claude/settings.local.json`), and the resolved installation directory are
+`~/.claude/settings.local.json`), user-level agent instructions
+(`~/.claude/CLAUDE.md`, `agents`, `commands`, `skills`, `~/.codex/AGENTS.md`,
+`AGENTS.override.md`) and the programs that the agent config names (hooks, MCP
+servers, Codex `notify`; see
+[agent instructions and config programs](threat-model.md#agent-instructions-and-config-programs)),
+and the resolved installation directory are
 denied. Generated rules protect conventional paths, resolved targets, and every
 ancestor against rename. Launch PATH directories, launcher paths, the
 Python/AWS CLI installation prefixes (including the interpreter and venv of
@@ -46,10 +51,11 @@ is allowed so shell globs report denied files rather than silently skipping them
 Mach services named in the sandbox profile are denied.
 
 Because ancestors of protected paths are denied as literals (against
-rename-in), **a missing `~/.ssh` or `~/.claude` cannot be created inside a
-run**. On a fresh account, the first `ssh` (which creates `~/.ssh/known_hosts`)
-or the first `claude` (which creates `~/.claude/projects`) fails in the
-sandbox. Run `ssh` and `claude` once outside the sandbox first. After that,
+rename-in), **a missing `~/.ssh`, `~/.claude` or `~/.codex` cannot be created
+inside a run**. On a fresh account, the first `ssh` (which creates
+`~/.ssh/known_hosts`), the first `claude` (which creates `~/.claude/projects`)
+or the first `codex` fails in the sandbox. Run `ssh`, `claude` and `codex`
+once outside the sandbox first. After that,
 `known_hosts` and `~/.claude/projects` stay writable.
 
 `sandbox-exec` is technically deprecated by Apple but has shown no signs of
@@ -76,7 +82,8 @@ Networking is still shared; the egress lock is a separate future step.
 
 Existing shell startup files, `~/.config/brnr`, `~/Library/LaunchAgents`, git
 and SSH configuration and the files and programs that it refers to, Claude
-Code settings, and the installation directory are mounted read-only. A private directory skeleton
+Code settings, user-level agent instructions and the programs that the agent
+config names, and the installation directory are mounted read-only. A private directory skeleton
 for HOME and the parents of protected paths prevents a missing protected path
 from being created persistently on the host. Linux also protects systemd user
 units and autostart entries. Existing ordinary children (such as project
@@ -86,13 +93,20 @@ an existing writable directory. `~/.ssh` and `~/.claude` are skeletons too:
 existing `known_hosts` and `~/.claude/projects` stay writable, but a new
 top-level entry there (for example a first `known_hosts`) is private to the
 run. The same applies to **every directory between HOME and a git or SSH
-config target**, also when the target is missing. For example, when
+config target or a program that the agent config names**, also when the
+target is missing. For example, when
 `~/.gitconfig` includes `~/Source/github.com/me/dotfiles/git-extra`, a
 `git clone` into `~/Source/github.com/<new-owner>/` is lost when the run ends,
 and `[includeIf "gitdir:~/work/"]` with `path = ~/work/.gitconfig` makes
-`~/work` a skeleton. An existing top-level entry in a skeleton directory is a
+`~/work` a skeleton. An MCP server `command` of
+`~/.nvm/versions/node/v22/bin/npx` makes `~/.nvm`, `~/.nvm/versions`, …,
+`~/.nvm/versions/node/v22/bin` skeletons, so new top-level entries from
+`nvm install` or `npm i -g` in a run are lost. `~/.codex` is not a skeleton:
+it is bound read-write and only its existing `AGENTS.md` and
+`AGENTS.override.md` are bound read-only, so a missing one can be created in a
+run on Linux (macOS denies it). An existing top-level entry in a skeleton directory is a
 bind mount: it cannot be replaced by rename or unlinked. At run start,
-agent-aws prints the skeleton directories that come from git and SSH targets.
+agent-aws prints the skeleton directories that come from git, SSH and agent config targets.
 The reason is in the
 [threat model](threat-model.md#what-normal-use-now-breaks-inside-a-run).
 Symlink targets of protected startup files are also read-only, including targets reached through symlinked ancestors. Launch
