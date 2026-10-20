@@ -544,7 +544,7 @@ def script_python(path):
     return None
 
 
-def python_paths(python):
+def python_paths(python, role="AWS CLI interpreter"):
     # A different interpreter (e.g. `pip install --user awscli`) loads its own
     # prefix, site-packages and user site. Fail closed if they are unknown.
     try:
@@ -554,7 +554,7 @@ def python_paths(python):
             raise ValueError(result.stderr)
         return [Path(path) for path in json.loads(result.stdout) if path]
     except (OSError, subprocess.SubprocessError, TypeError, ValueError):
-        die(f"cannot determine the Python paths of the AWS CLI interpreter {python}")
+        die(f"cannot determine the Python paths of the {role} {python}")
 
 
 def home_or_ancestor(path):
@@ -913,6 +913,11 @@ def protected_paths(targets=None):
                     if not home_or_ancestor(candidate):
                         paths.add(candidate)
                         break
+                if name == "python3" and home_or_ancestor(resolved.parent.parent):
+                    # The fallback leaves the prefix's stdlib and site-packages
+                    # open; protect the interpreter's own paths (PR #21, nit 1).
+                    paths.update(p for p in python_paths(resolved, "python3 interpreter")
+                                 if p.is_absolute() and not home_or_ancestor(p))
     paths.update((Path(sys.prefix), Path(sys.base_prefix)))
     paths.update(config_targets() if targets is None else targets)
     aws = shutil.which("aws", path=executable_path())
