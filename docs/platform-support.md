@@ -52,6 +52,15 @@ is HOME or an ancestor of HOME, only the executable's directory (or only the
 executable, if that directory is HOME or an ancestor too) and `python3`'s own
 install paths are protected; see the
 [threat model](threat-model.md#2-cred-minting-outside-the-sandbox) for details.
+Every symlink on the PATH chain of `agent-aws`, `aws` and `python3` (the link itself, not
+its directory) is protected too. So is the install location of the run's own
+command, for example `~/.local/share/claude` behind `~/.local/bin/claude`,
+but never HOME, `/`, an ancestor of HOME or the working tree, and never a
+direct child of HOME as its prefix (a plain `~/.local/bin/goose` protects
+only `~/.local/bin`); see
+[the run's own command](threat-model.md#the-runs-own-command). Auto-update of
+`claude` or `codex` inside a run therefore fails: update them outside the
+sandbox.
 Other runs' files are unreadable and unwritable; limited pathname metadata
 is allowed so shell globs report denied files rather than silently skipping them.
 `open`, `osascript`, `launchctl`, mounts, and the Launch Services / quarantine
@@ -111,13 +120,17 @@ and `[includeIf "gitdir:~/work/"]` with `path = ~/work/.gitconfig` makes
 `~/work` a skeleton. An MCP server `command` of
 `~/.nvm/versions/node/v22/bin/npx` makes `~/.nvm`, `~/.nvm/versions`, …,
 `~/.nvm/versions/node/v22/bin` skeletons, so new top-level entries from
-`nvm install` or `npm i -g` in a run are lost. `~/.codex` is not a skeleton:
+`nvm install` or `npm i -g` in a run are lost. The install location of the
+run's own command has the same cost: for `claude`, `~/.local/share` is a
+skeleton. `~/.codex` is not a skeleton:
 it is bound read-write and only its existing `AGENTS.md` and
 `AGENTS.override.md` are bound read-only, so a missing one can be created in a
 run on Linux (macOS denies it). If one of these instruction files is a
 symlink (for example into a dotfiles repo), `~/.codex` stays a skeleton: new
 top-level entries in it are lost when the run ends, and a rename-replace of
-`config.toml` fails. `~/.config/fish` and `~/.oh-my-zsh` are bound
+`config.toml` fails. The Codex standalone install below `~/.codex/packages`
+keeps the read-write bind: only `~/.codex/packages` and the directories below
+it on the way to the install become skeletons. `~/.config/fish` and `~/.oh-my-zsh` are bound
 the same way: `fish_variables` and the oh-my-zsh checkout are plain files in a
 read-write bind, so `set -U` and `omz update` can replace them by rename. Only
 the existing `config.fish`, `conf.d`, `functions`, `completions` and
@@ -130,10 +143,15 @@ saved** (fish replaces `fish_variables` by rename) and `omz update` can fail on
 top-level files of the checkout. An existing top-level entry in a skeleton directory is a
 bind mount: it cannot be replaced by rename or unlinked. At run start,
 agent-aws prints the skeleton directories that come from git, SSH and agent config
-targets and from the `$PYTHONSTARTUP` file.
+targets, the `$PYTHONSTARTUP` file, the run's own command and the PATH symlinks
+of `agent-aws`, `aws` and `python3`.
 The reason is in the
 [threat model](threat-model.md#what-normal-use-now-breaks-inside-a-run).
-Symlink targets of protected startup files are also read-only, including targets reached through symlinked ancestors. Launch
+Symlink targets of protected startup files are also read-only, including targets reached through symlinked ancestors. A
+protected PATH symlink whose target is HOME or an ancestor of HOME, or a
+strict ancestor of the working tree, is not mounted from its target: it is a
+private copy of the link, so a repoint in a run is lost when the run ends,
+and HOME and the working tree stay writable. Launch
 PATH directories and executable installation paths are protected too. This avoids the missing-file hole in `--ro-bind-try`.
 
 ### Unprivileged user namespaces

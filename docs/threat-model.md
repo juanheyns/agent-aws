@@ -77,7 +77,21 @@ ancestors) are protected too; the other directories of that prefix (for
 `aws`, or non-Python files) are not. HOME is compared both as given and
 resolved. The agent-aws interpreter's own prefix (`sys.prefix`, `sys.base_prefix`) is protected
 without this HOME rule: if that prefix is HOME's parent, HOME stays
-write-denied (fail-safe).
+write-denied (fail-safe). Every symlink on the chain from the `agent-aws`,
+`aws` and `python3` PATH entries to their targets is protected too, also directory
+links in the middle (for example `current -> releases/1`), so a run cannot
+repoint a link in a writable directory (`<PATH>/aws -> ~/link -> …`) to its
+own file ([#23](https://github.com/juanheyns/agent-aws/issues/23)). The link
+itself is protected, not its directory and not its target (a `/tmp` link
+does not protect `/private/tmp`). Links that are HOME or an ancestor of HOME
+are skipped (a symlinked HOME). A link whose target is HOME or an ancestor of
+HOME is protected too (for example `~/d/h -> ~`, or the root-owned
+`/var -> private/var` on macOS): macOS denies writes to the link path only,
+and Linux mounts a private copy of the link (`--symlink`) in its skeleton
+directory, never its target, so HOME stays writable and a repoint in a run is
+lost when the run ends. Linux does the same for a link to a strict ancestor
+of the working tree, so that the tree stays writable. More than 40 links on
+one path fail closed.
 The developer still supplies a trusted initial PATH and installation; this
 is not a scan of pre-existing executables for malicious content.
 
@@ -239,6 +253,9 @@ list of known paths. It does not block it in general.
   installation prefixes, the interpreter paths of a Python `aws` script
   (including the venv of a venv interpreter), and
   each Homebrew prefix except `var/`.
+- The install location of the run's own command (`agent-aws run -- claude`):
+  the symlinks on its PATH chain and its install prefix. See
+  [the run's own command](#the-runs-own-command).
 - For each path: its resolved symlink target. On macOS every ancestor is also
   protected against rename.
 
@@ -417,6 +434,69 @@ runs. For these, use the
 [strong boundary](#supported-host-isolation-boundary)
 ([#14](https://github.com/juanheyns/agent-aws/issues/14)).
 
+### The run's own command
+
+Agent CLIs are often installed as a symlink in a PATH directory into a
+writable install tree in HOME
+([#13](https://github.com/juanheyns/agent-aws/issues/13)). The PATH
+directory is protected, but the target was not, so a run could replace the
+`claude` binary that the developer next starts unsandboxed. Before the
+sandbox starts, agent-aws finds the run's command (`args[0]`) in PATH, as the
+shell does (a name with a `/` is relative to the current directory), and
+protects:
+
+- Every symlink on the way to the executable (file links and directory links
+  in the middle), as for `aws` above.
+- The first of its resolved install prefix (`../..`), bin directory and
+  executable that is allowed by the rules below. The prefix is never a
+  direct child of HOME (as given or resolved), such as `~/.local`,
+  `~/.cargo`, `~/go` or `~/.bun`: then the bin directory is used. (`aws` and
+  `python3` keep the rule above, so `~/.local/bin/aws` protects `~/.local`.)
+
+Examples: `~/.local/bin/claude -> ~/.local/share/claude/versions/2.1.301`
+protects the link and `~/.local/share/claude`. The Codex standalone install
+(`~/.local/bin/codex -> ~/.codex/packages/standalone/current/bin/codex`, with
+`current -> releases/0.160.1-aarch64-apple-darwin`) protects the link,
+`current` and `releases/0.160.1-aarch64-apple-darwin`. A plain file
+`~/.local/bin/goose` protects only `~/.local/bin`; `cargo install` and
+`go install` commands (`~/.cargo/bin/<x>`, `~/go/bin/<x>`) protect only
+`~/.cargo/bin` or `~/go/bin`.
+
+A link on the chain is skipped only when its target is the working tree or
+is inside it: the run can write there anyway. A link whose target is a
+strict ancestor of the working tree is protected, because the executable
+behind it is outside the tree (`~/d/l -> ~/src` with the tree `~/src/proj`
+and `~/.local/bin/tool -> ~/d/l/tools/bin/tool`). On Linux such a link is a
+private copy (`--symlink`), never a read-only mount of its target, so the
+working tree stays writable and a repoint in a run is lost when the run
+ends. A link to HOME or an ancestor of HOME is protected in the same way, as
+for `aws` above.
+
+Never protected:
+
+- HOME, `/` and the other ancestors of HOME (as given and resolved). So
+  `/bin/sh` protects `/bin` on macOS and `/usr` on Linux, and `~/tool`
+  protects only the executable.
+- The working tree: the current directory (as given and resolved), the
+  nearest ancestor with a `.git` entry (found without running git), their
+  ancestors and everything inside them. So `./script` or `../tools/x` in the
+  project makes nothing in the project read-only. When the current directory
+  is HOME or an ancestor of HOME, or the `.git` is in HOME (a dotfiles
+  repository), only the HOME rule applies.
+
+Still not protected:
+
+- Other executables in PATH that are not the run's command, for example the
+  target of `~/.local/bin/codex` when you run `claude`. A later unsandboxed
+  `codex` can start a binary that this run replaced.
+- A command started through a wrapper: `sh -c 'claude'`, `env X=1 claude`,
+  `npx …`, `uvx …`. Only `args[0]` is followed.
+- The interpreter and libraries of a script command (for example the `node`
+  that a `#!/usr/bin/env node` command runs, and its `node_modules`, or the
+  `~/.local/lib/python*/site-packages` of a `pip install --user` command in
+  `~/.local/bin`).
+- A command inside the working tree: it is output of the run anyway.
+
 ### What normal use now breaks inside a run
 
 - You cannot edit an included git config file, a script in the
@@ -445,7 +525,7 @@ runs. For these, use the
 - At run start on Linux, agent-aws prints the skeleton directories that come
   from git, SSH and agent config targets (`agent-aws: Linux: new top-level
   entries in these directories are lost when the run ends (they hold protected
-  git/ssh/agent config targets): …`). Create new projects outside these directories, or move the
+  git/ssh/agent config, $PYTHONSTARTUP or the run's command): …`). Create new projects outside these directories, or move the
   target out of the project tree.
 - Why every directory between HOME and the target: a read-only bind of only
   the target, in a read-write parent, is not sufficient. Linux refuses to
@@ -483,9 +563,14 @@ runs. For these, use the
   `~/.codex` and each existing instruction file are mount points (`EBUSY`).
   The cost: on Linux, a missing `~/.codex/AGENTS.md` or
   `~/.codex/AGENTS.override.md` can be created in a run and stays on the host
-  (macOS denies it). If a config target is below `~/.codex` (for example a
-  `notify` program in `~/.codex/bin`), `~/.codex` stays a skeleton, so a
-  missing program there cannot be created. **The parent bind is used only when
+  (macOS denies it). If a config target is a missing direct child of
+  `~/.codex`, or is below a direct child that is missing or a symlink (for
+  example a `notify` program in a missing `~/.codex/bin`), `~/.codex` stays a
+  skeleton, so a missing program there cannot be created. If that direct
+  child is an existing real directory (the Codex install in
+  `~/.codex/packages`, or an existing `~/.codex/bin`), `~/.codex` stays a
+  read-write bind and only that child becomes a private skeleton (a mount
+  point, so it cannot be renamed). **The parent bind is used only when
   no protected child is a symlink.** If `~/.codex/AGENTS.md` or
   `AGENTS.override.md` is a symlink (existing or dangling, for example into a
   dotfiles repo with GNU stow), `~/.codex` stays a skeleton on Linux and the
@@ -496,6 +581,37 @@ runs. For these, use the
   would fail to start, or `rm` plus a new file would persist on the host.
   This was not tested with the real
   Codex ([#8](https://github.com/juanheyns/agent-aws/issues/8)).
+- The run's own command is read-only in a run
+  ([#13](https://github.com/juanheyns/agent-aws/issues/13)): **auto-update
+  of `claude` or `codex` inside a run fails** (it writes a new version to
+  `~/.local/share/claude/versions` or `~/.codex/packages/standalone` and
+  repoints the link). Update them outside the sandbox. On macOS a new
+  `releases/<version>` directory can still be created next to the protected
+  one, but `current` cannot be repointed. What becomes read-only is exactly
+  the install location above. For a plain file in `~/.local/bin` (or
+  `~/.cargo/bin`, `~/go/bin`) that is only the bin directory, which is
+  already protected as a PATH directory: no new cost. A deeper install
+  prefix is read-only in the run, for example `~/.local/share/claude`,
+  `~/.codex/packages/standalone/releases/<version>`, or
+  `~/.nvm/versions/node/v20` for a plain `~/.nvm/versions/node/v20/bin/node`
+  (so `npm i -g` into it fails). `npm i -g`, `pip install` or `brew upgrade`
+  of the run's command in a run fail when they write into that prefix.
+- **On Linux, every directory between HOME and the run's command or a
+  protected PATH chain link becomes a private skeleton**, as for a git target
+  above: for `claude`, `~/.local/share` (new top-level entries in it are lost
+  when the run ends; existing entries cannot be renamed); for `codex`,
+  `~/.codex/packages`, `~/.codex/packages/standalone` and
+  `~/.codex/packages/standalone/releases` (`~/.codex` itself stays a
+  read-write bind, see above); for `~/.nvm/versions/node/v20` above,
+  `~/.nvm`, `~/.nvm/versions` and `~/.nvm/versions/node`. A plain file in
+  `~/.local/bin` adds none: `~/.local` is already a skeleton because
+  `~/.local/bin` is a PATH directory. The note at run start lists them, also
+  the skeletons of an `agent-aws`/`aws`/`python3` chain link (for example
+  `~/d` for `~/d/link`). On Linux a protected directory link is mounted
+  read-only from its target, so its target directory is read-only in the run
+  too (on macOS only the link is protected). A link to HOME or an ancestor of
+  HOME, or to a strict ancestor of the working tree, is the exception: it is
+  a private copy of the link (see above).
 - You cannot edit fish `config.fish`, `conf.d`, `functions` or `completions`;
   `fisher install`/`update` and `funcsave` fail. `set -U` works on both
   platforms: on Linux, `~/.config/fish` is bound read-write (like `~/.codex`)
@@ -545,7 +661,7 @@ with disposable fixtures that a run can still write these. Each one is tracked:
 
 | Class | Example that stays writable | Issue |
 |---|---|---|
-| Install targets of symlinked PATH executables | `~/.local/share/claude/versions/*` behind `~/.local/bin/claude` | [#13](https://github.com/juanheyns/agent-aws/issues/13) |
+| Install targets of PATH executables that are not the run's command, commands started through a wrapper, interpreters of script commands | the `codex` install when you run `claude`; `sh -c 'claude'`, `env X=1 claude`, `npx`; the `node` and `node_modules` of a Node CLI | [#24](https://github.com/juanheyns/agent-aws/issues/24) (the run's own command is protected since [#13](https://github.com/juanheyns/agent-aws/issues/13); see [the run's own command](#the-runs-own-command)) |
 | Git/SSH commands that are shell strings, and config that agent-aws does not parse | `!sh -c '…'` aliases, `ProxyCommand sh -c …`, a relative `core.hooksPath`, system git config, `/etc/ssh/ssh_config`, ssh `${VAR}` paths | [#6](https://github.com/juanheyns/agent-aws/issues/6) (decision: not resolvable in general; see [git and SSH config targets](#git-and-ssh-config-targets)) |
 | Repository-local configuration | `.git/config` (`core.fsmonitor`), `.git/hooks`, project `.claude/settings.json`, `.envrc` | [#7](https://github.com/juanheyns/agent-aws/issues/7) |
 | Agent config that the agent writes itself | `~/.claude.json` itself (a new `mcpServers` entry), `~/.claude/plugins/**`, `~/.codex/config.toml` itself (a new `mcp_servers` or `notify`), files that `~/.claude/CLAUDE.md` imports with `@path`, interpreter-prefixed hook commands, other agents (not surveyed); project config is [#7](https://github.com/juanheyns/agent-aws/issues/7) | [#8](https://github.com/juanheyns/agent-aws/issues/8) (needs a test with the real agents; see [agent instructions and config programs](#agent-instructions-and-config-programs)) |
