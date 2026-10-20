@@ -705,6 +705,135 @@ sys.exit(0 if rc == 0 else 1)
         finally:
             shutil.rmtree(work)
 
+    def scratch_home(self, work):
+        # A separate scratch HOME with the fixture config and fake SSO token.
+        home = work / "home"
+        for relative in (".agent-aws/config.json", ".aws/sso/cache/fake.json"):
+            (home / relative).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self.home / relative, home / relative)
+        (home / "project").mkdir()
+        return home
+
+    def run_in(self, home, env, argv, cwd=None):
+        return subprocess.run([str(ROOT / "bin/agent-aws"), "run", "--", *argv], env=env,
+                              cwd=cwd or home, capture_output=True, text=True, timeout=30)
+
+    def test_issue23_middle_links_of_aws_and_python3_chain(self):
+        # Issue #23: PATH `<W>/p/<name> -> ~/link -> ~/d/link -> target`. Run 1
+        # must not repoint a middle link; run 2 still uses the original target.
+        # On Linux, symlinks that are direct children of HOME are private
+        # anyway (mirror()), so ~/d/link is the one that fails before the fix.
+        for name in ("aws", "python3"):
+            with self.subTest(name=name):
+                work = self.home / f"issue23-{name}"
+                home = self.scratch_home(work)
+                if name == "aws":
+                    target = work / "opt/x/bin/aws"
+                    target.parent.mkdir(parents=True)
+                    shutil.copy2(self.home / "bin/aws", target)
+                else:
+                    target = Path(sys.executable)  # a real interpreter, so a probe works
+                evil = work / "evil" / name
+                evil.parent.mkdir()
+                evil.write_text(f"#!{sys.executable} -I\n" + '''import json
+print(json.dumps({"roleCredentials": {"accessKeyId": "EVIL-KEY",
+    "secretAccessKey": "EVIL", "sessionToken": "EVIL"}}))
+''')
+                evil.chmod(0o700)
+                (home / "d").mkdir()
+                (home / "d/link").symlink_to(target)
+                (home / "link").symlink_to(home / "d/link")
+                (work / "p").mkdir()
+                (work / "p" / name).symlink_to(home / "link")
+                env = dict(self.env, HOME=str(home), PATH=f"{work}/p:{self.home}/bin:" + os.environ["PATH"])
+                try:
+                    for link in ("d/link", "link"):
+                        result = self.run_in(home, env, ["/bin/sh", "-c", f'ln -sfn "{evil}" "$HOME/{link}"'])
+                        print(f"ISSUE23 {name} ln -sfn ~/{link}: exit={result.returncode} "
+                              f"[{result.stderr.strip()}]", flush=True)
+                        if sys.platform == "darwin":
+                            self.assertNotEqual(result.returncode, 0, f"~/{link} repointed")
+                            self.assertRegex(result.stderr.lower(), "not permitted")
+                    self.assertEqual(os.readlink(home / "d/link"), str(target), "~/d/link repointed on the host")
+                    self.assertEqual(os.readlink(home / "link"), str(home / "d/link"),
+                                     "~/link repointed on the host")
+                    # Positive control: HOME stays writable; run 2 uses the original target.
+                    result = self.run_in(home, env, ["/bin/sh", "-c", 'echo ok > "$HOME/project/x" && '
+                                                     'cat "$AWS_SHARED_CREDENTIALS_FILE"'])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual((home / "project/x").read_text(), "ok\n")
+                    self.assertIn("FAKE-KEY", result.stdout)
+                    self.assertNotIn("EVIL-KEY", result.stdout)
+                    self.assertEqual((work / "p" / name).resolve(), target.resolve())
+                    print(f"ISSUE23 {name} PASS: links unchanged, HOME writable, run 2 minted FAKE-KEY",
+                          flush=True)
+                finally:
+                    shutil.rmtree(work)
+
+    def test_issue13_run_command_install_location(self):
+        # Issue #13: the run's own command is a symlink in ~/.local/bin into
+        # its install location (claude: a versions/ file; codex: a `current`
+        # directory link). Run 1 cannot change it; run 2 runs the original.
+        work = self.home / "issue13"
+        home = self.scratch_home(work)
+        fake = '#!/bin/sh\necho {}-ORIGINAL\nexec /bin/sh "$@"\n'
+        claude = home / ".local/share/claude/versions/1.0"
+        release = home / ".codex/packages/standalone/releases/1.0"
+        for path, text in ((claude, fake.format("CLAUDE")), (release / "bin/codex", fake.format("CODEX"))):
+            path.parent.mkdir(parents=True)
+            path.write_text(text)
+            path.chmod(0o700)
+        (release.parent / "evil/bin").mkdir(parents=True)
+        current = home / ".codex/packages/standalone/current"
+        current.symlink_to("releases/1.0")
+        (home / ".local/bin").mkdir(parents=True)
+        (home / ".local/bin/claude").symlink_to(claude)
+        (home / ".local/bin/codex").symlink_to(current / "bin/codex")
+        (home / ".codex/config.toml").write_text('model = "fixture"\n')
+        env = dict(self.env, HOME=str(home), PATH=f"{home}/.local/bin:{self.home}/bin:" + os.environ["PATH"])
+        cwd = home / "project"
+        try:
+            attacks = {
+                "claude": ["echo 'echo EVIL' >> ~/.local/share/claude/versions/1.0",
+                           "echo evil > ~/.local/share/claude/versions/2.0"],
+                "codex": ["echo 'echo EVIL' >> ~/.codex/packages/standalone/releases/1.0/bin/codex",
+                          "ln -sfn releases/evil ~/.codex/packages/standalone/current"],
+            }
+            for program, commands in attacks.items():
+                for command in commands:
+                    result = self.run_in(home, env, [program, "-c", command], cwd)
+                    print(f"ISSUE13 {program} -c {command}: exit={result.returncode} "
+                          f"[{result.stderr.strip()}]", flush=True)
+                    # Linux: `current` is a mount point in a private skeleton
+                    # (EBUSY); only the host link must be unchanged.
+                    if sys.platform == "darwin" or "ln -sfn" not in command:
+                        self.assertNotEqual(result.returncode, 0, command)
+                        self.assertRegex(result.stderr.lower(),
+                                         "not permitted|permission denied|read-only file system")
+            self.assertEqual(claude.read_text(), fake.format("CLAUDE"))
+            self.assertFalse(claude.with_name("2.0").exists(), "new claude version persisted")
+            self.assertEqual((release / "bin/codex").read_text(), fake.format("CODEX"))
+            self.assertEqual(os.readlink(current), "releases/1.0", "codex `current` repointed on the host")
+            # Run 2 runs the originals. Positive controls: the project is
+            # writable, and codex can still replace its config by rename (on
+            # Linux ~/.codex stays a read-write bind).
+            result = self.run_in(home, env, ["claude", "-c", 'echo ok > "$HOME/project/x"'], cwd)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("CLAUDE-ORIGINAL", result.stdout)
+            self.assertNotIn("EVIL", result.stdout)
+            self.assertEqual((home / "project/x").read_text(), "ok\n")
+            result = self.run_in(home, env, ["codex", "-c", "printf 'model = \"renamed\"\\n' > "
+                                             "~/.codex/.config.toml.tmp && "
+                                             "mv ~/.codex/.config.toml.tmp ~/.codex/config.toml"], cwd)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("CODEX-ORIGINAL", result.stdout)
+            self.assertNotIn("EVIL", result.stdout)
+            self.assertIn("renamed", (home / ".codex/config.toml").read_text())
+            print("ISSUE13 PASS: install locations unchanged, run 2 ran the originals, "
+                  "~/project writable, ~/.codex/config.toml replaced by rename", flush=True)
+        finally:
+            shutil.rmtree(work)
+
     def test_issue4_aws_script_using_other_python(self):
         # Round-3 note: `aws` may be a non-isolated script for another Python
         # (e.g. `pip install --user awscli`) whose user site we do not use.

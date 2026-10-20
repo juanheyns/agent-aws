@@ -475,6 +475,93 @@ class ConfigTests(unittest.TestCase):
                     probe.assert_not_called()
                     self.assertFalse(stdlib in protected, "aws prefix lib protected")
 
+    def chain_fixture(self, name, layout):
+        # Issue #23: PATH `<W>/p/<name>` -> a link in HOME -> target. HOME is
+        # `<W>/hl/home` with `<W>/hl -> <W>/real`, so each link in HOME has a
+        # resolved-parent and a HOME-lexical form.
+        work = self.home / f"issue23-{name}-{layout}"
+        (work / "real/home/d").mkdir(parents=True)
+        (work / "hl").symlink_to(work / "real")
+        home, real = work / "hl/home", work / "real/home"
+        middle = {"home": "link", "x": "link", "subdir": "d/link", "dir": "d/cur"}[layout]
+        target = real / name if layout == "home" else work / "opt/x/bin" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("#!/bin/sh\n")
+        target.chmod(0o700)
+        if layout == "dir":
+            # A directory link in the middle: `~/d/cur -> <W>/opt/x`.
+            (real / middle).symlink_to(work / "opt/x")
+            first = home / middle / "bin" / name
+        else:
+            (real / middle).symlink_to(target)
+            first = home / middle
+        (work / "p").mkdir()
+        (work / "p" / name).symlink_to(first)
+        return work, home, real, middle, target
+
+    def test_issue23_middle_links_in_path_chain_are_protected(self):
+        # PR #21 review round 2: `<W>/p/<name> -> ~/link -> ~/<name>` and
+        # `-> ~/link -> <W>/opt/x/bin/<name>`; also a link in a HOME subdir
+        # and a directory link in the middle. agent-aws has the same chain
+        # protection (no install prefix).
+        for name in ("aws", "python3", "agent-aws"):
+            for layout in ("home", "x", "subdir", "dir"):
+                with self.subTest(name=name, layout=layout):
+                    work, home, real, middle, target = self.chain_fixture(name, layout)
+                    with mock.patch.dict(os.environ, {"PATH": str(work / "p")}), \
+                         mock.patch.multiple(agent, HOME=home,
+                                             python_paths=mock.Mock(return_value=[])):
+                        protected = agent.protected_paths()
+                    self.assertTrue(real / middle in protected, f"~/{middle} (resolved parent) not protected")
+                    self.assertTrue(home / middle in protected, f"~/{middle} (HOME-lexical) not protected")
+                    self.assertTrue(work / "p" / name in protected, "PATH entry not protected")
+                    for path in (home, real, work / "hl", work / "real", work, real / "d"):
+                        self.assertFalse(path in protected, f"{path} (HOME, an ancestor or a link's dir) protected")
+                    # The #19 rules for the final target still hold.
+                    if name == "agent-aws":
+                        continue
+                    if layout == "home":
+                        self.assertTrue(target in protected, "final target not protected")
+                    else:
+                        self.assertTrue(work / "opt/x" in protected, "prefix not protected")
+                        self.assertFalse(work / "opt" in protected, "prefix parent protected")
+
+    @unittest.skipUnless(Path("/var").is_symlink(), "macOS /var -> private/var")
+    def test_issue23_system_link_to_home_ancestor_not_protected(self):
+        # `/var -> private/var` is on the chain when PATH uses the lexical
+        # /var path; its target is an ancestor of HOME, so it is skipped.
+        if not str(self.home).startswith("/private/var/"):
+            self.skipTest("temp dir is not below /private/var")
+        home = self.home / "var-home"
+        home.mkdir()
+        bin_dir = self.home / "var-opt/x/bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "aws").write_text("#!/bin/sh\n")
+        (bin_dir / "aws").chmod(0o700)
+        with mock.patch.dict(os.environ, {"PATH": str(bin_dir)[len("/private"):]}), \
+             mock.patch.multiple(agent, HOME=home, python_paths=mock.Mock(return_value=[])):
+            protected = agent.protected_paths()
+        self.assertFalse(Path("/var") in protected, "/var link protected")
+        self.assertFalse(Path("/private/var") in protected, "/private/var protected")
+        self.assertTrue(self.home / "var-opt/x" in protected, "prefix not protected")
+
+    def test_issue23_symlink_chain_hop_limit_fails_closed(self):
+        (self.home / "a").symlink_to(self.home / "b")
+        (self.home / "b").symlink_to(self.home / "a")
+        (self.home / "loop").symlink_to(self.home / "a")
+        with self.assertRaises(SystemExit):
+            agent.symlink_chain(self.home / "loop/x")
+        # Exactly SYMLINK_HOPS (40) links is accepted; 41 fails closed.
+        previous = self.home / "end"
+        previous.write_text("x")
+        for index in range(41):
+            (self.home / f"hop{index}").symlink_to(previous)
+            previous = self.home / f"hop{index}"
+        with mock.patch.object(agent, "HOME", self.home / "elsewhere"):
+            self.assertEqual(len(agent.symlink_chain(self.home / "hop39")), 40)
+            with self.assertRaises(SystemExit):
+                agent.symlink_chain(self.home / "hop40")
+
     def test_round4_script_python_trampoline_env_options_and_pypy(self):
         # Review round 1, finding 6.
         bindir = self.home / "pathbin"
@@ -768,8 +855,8 @@ class Issue6ResolverTests(unittest.TestCase):
         self.assertIn(f"--bind {home}/Source/github.com/other {home}/Source/github.com/other", argv)
         note = error.getvalue()
         self.assertIn("agent-aws: Linux: new top-level entries in these directories are lost "
-                      "when the run ends (they hold protected git/ssh/agent config or "
-                      "$PYTHONSTARTUP targets): ", note)
+                      "when the run ends (they hold protected git/ssh/agent config, "
+                      "$PYTHONSTARTUP or the run's command): ", note)
         self.assertIn("~/Source, ~/Source/github.com, ~/Source/github.com/me, "
                       "~/Source/github.com/me/dotfiles, ~/work\n", note)
         # Skeletons that STARTUP_PATHS make anyway, and read-only
@@ -1056,6 +1143,157 @@ class Issue9StartupCodeTests(unittest.TestCase):
         self.assertIn(f"--ro-bind {self.home}/dotfiles/omz-custom {omz}/custom ", joined)
         # Skeleton: the existing oh-my-zsh.sh is a writable mount point.
         self.assertIn(f"--bind {omz}/oh-my-zsh.sh {omz}/oh-my-zsh.sh ", joined)
+
+
+class Issue13CommandTests(unittest.TestCase):
+    """Install location of the run's own command (issue #13), scratch HOME only."""
+
+    CODEX_RELEASE = ".codex/packages/standalone/releases/0.160.1-aarch64-apple-darwin"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name).resolve()
+        home = self.home
+        (home / "project").mkdir()
+        (home / ".local/bin").mkdir(parents=True)
+        # claude: `~/.local/bin/claude -> ~/.local/share/claude/versions/2.1.301`.
+        self.executable(".local/share/claude/versions/2.1.301")
+        (home / ".local/bin/claude").symlink_to(home / ".local/share/claude/versions/2.1.301")
+        # codex standalone: `~/.local/bin/codex -> …/current/bin/codex`, with
+        # `current -> releases/0.160.1-aarch64-apple-darwin`.
+        self.executable(f"{self.CODEX_RELEASE}/bin/codex")
+        (home / ".codex/packages/standalone/current").symlink_to("releases/0.160.1-aarch64-apple-darwin")
+        (home / ".local/bin/codex").symlink_to(home / ".codex/packages/standalone/current/bin/codex")
+        self.executable("tool")
+        self.executable("project/script")
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(home / "project")
+        for patcher in (mock.patch.dict(os.environ, {"PATH": f"{home}/.local/bin:/usr/bin:/bin"}),
+                        mock.patch.object(agent, "HOME", home)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def executable(self, name):
+        path = self.home / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o700)
+        return path
+
+    def assert_home_and_tree_open(self, paths, *trees):
+        for path in (self.home, *self.home.parents, *trees):
+            self.assertNotIn(path, paths, f"{path} protected")
+        for tree in trees:
+            self.assertFalse(any(tree in path.parents for path in paths), f"path inside {tree} protected")
+
+    def test_issue13_claude_and_codex_install_locations(self):
+        home = self.home
+        claude = agent.command_paths("claude")
+        self.assertEqual(claude, {home / ".local/bin/claude", home / ".local/share/claude"})
+        codex = agent.command_paths("codex")
+        self.assertEqual(codex, {home / ".local/bin/codex", home / ".codex/packages/standalone/current",
+                                 home / self.CODEX_RELEASE})
+        self.assert_home_and_tree_open(claude | codex, home / "project")
+        self.assertEqual(agent.command_paths("no-such-command-agent-aws"), set())
+        # The paths are final: protected_paths() keeps the link itself and
+        # does not resolve a directory link to its target's parent.
+        with mock.patch.multiple(agent, AWS_DIR=home / ".aws", AGENT_DIR=home / ".agent-aws"):
+            protected = agent.protected_paths(set(), codex | claude)
+        self.assertTrue(codex | claude <= protected)
+        self.assertNotIn(home / ".codex/packages/standalone/releases", protected)
+        self.assertNotIn(home / ".codex/packages/standalone", protected)
+
+    def test_issue13_system_shell_protects_neither_root_nor_home(self):
+        paths = agent.command_paths("/bin/sh")
+        resolved = Path("/bin/sh").resolve()
+        self.assertNotIn(Path("/"), paths)
+        self.assertIn(resolved.parent.parent if resolved.parent.parent != Path("/") else resolved.parent,
+                      paths)  # macOS: /bin; Linux (merged /usr): /usr
+        self.assert_home_and_tree_open(paths, self.home / "project")
+
+    def test_issue13_command_in_working_tree_protects_nothing_there(self):
+        home = self.home
+        project = home / "project"
+        for program in ("./script", str(project / "script")):
+            with self.subTest(program=program):
+                self.assertEqual(agent.command_paths(program), set())
+        # A git toplevel above cwd (a `.git` dir or a worktree's `.git` file).
+        for kind in ("dir", "file"):
+            with self.subTest(git=kind):
+                repo = home / f"repo-{kind}"
+                (repo / "sub").mkdir(parents=True)
+                (repo / ".git").mkdir() if kind == "dir" else (repo / ".git").write_text("gitdir: x\n")
+                self.executable(f"repo-{kind}/tools/x")
+                (home / ".local/bin" / f"x-{kind}").symlink_to(repo / "tools/x")
+                os.chdir(repo / "sub")
+                for program in ("../tools/x", f"x-{kind}"):
+                    paths = agent.command_paths(program)
+                    self.assertEqual(paths, set(), program)
+                    self.assert_home_and_tree_open(paths, repo)
+        # cwd = <W>/project with no .git: `../tool` (in HOME) protects the executable only.
+        os.chdir(project)
+        self.assertEqual(agent.command_paths("../tool"), {home / "tool"})
+
+    def test_issue13_cwd_home_and_dotfiles_repo_in_home(self):
+        home = self.home
+        for setup in ("cwd-home", "dotfiles-git"):
+            with self.subTest(setup=setup):
+                if setup == "cwd-home":
+                    os.chdir(home)
+                else:
+                    (home / ".git").mkdir()
+                    os.chdir(home / "project")
+                self.assertEqual(agent.command_paths(str(home / "tool")), {home / "tool"})
+                claude = agent.command_paths("claude")
+                self.assertIn(home / ".local/share/claude", claude)
+                self.assert_home_and_tree_open(claude)
+
+    def linux_mounts(self, targets):
+        home = self.home
+        with mock.patch.multiple(agent, AWS_DIR=home / ".aws", AGENT_DIR=home / ".agent-aws"):
+            protected = agent.protected_paths(set(targets))
+            argv = " ".join(agent.linux_home_mounts(protected)) + " "
+            return protected, argv, agent.linux_target_skeletons(protected, set(targets))
+
+    def test_issue13_linux_codex_install_keeps_codex_parent_bind(self):
+        # Pure argv check (also on macOS). The codex install below
+        # ~/.codex/packages must not make ~/.codex a skeleton: codex replaces
+        # ~/.codex/config.toml by rename.
+        home = self.home
+        (home / ".codex/config.toml").write_text('model = "fixture"\n')
+        (home / ".codex/AGENTS.md").write_text("# fixture\n")
+        codex = {home / ".local/bin/codex", home / ".codex/packages/standalone/current",
+                 home / self.CODEX_RELEASE}
+        claude = {home / ".local/bin/claude", home / ".local/share/claude"}
+        protected, argv, skeletons = self.linux_mounts(codex | claude)
+        self.assertIn(home / ".codex", agent.linux_parent_binds(protected))
+        dot_codex, packages = home / ".codex", home / ".codex/packages"
+        standalone = packages / "standalone"
+        self.assertIn(f"--bind {dot_codex} {dot_codex} ", argv)
+        self.assertNotIn(f"--tmpfs {dot_codex} ", argv)
+        self.assertIn(f"--ro-bind {dot_codex}/AGENTS.md {dot_codex}/AGENTS.md ", argv)
+        self.assertIn(f"--tmpfs {packages} ", argv)
+        self.assertIn(f"--tmpfs {standalone} ", argv)
+        self.assertIn(f"--ro-bind {home / self.CODEX_RELEASE} {standalone}/current ", argv)
+        self.assertIn(f"--ro-bind {home / self.CODEX_RELEASE} {home / self.CODEX_RELEASE} ", argv)
+        self.assertNotIn(f"{dot_codex}/config.toml", argv)
+        self.assertLess(argv.index(f"--bind {dot_codex} "), argv.index(f"--tmpfs {packages} "))
+        self.assertIn(f"--ro-bind {home}/.local/share/claude {home}/.local/share/claude ", argv)
+        self.assertEqual(skeletons, [home / ".codex/packages", standalone, standalone / "releases",
+                                     home / ".local/share"])
+        # A missing or symlinked direct child on the way keeps the skeleton.
+        shutil.rmtree(packages)
+        (home / "elsewhere/standalone").mkdir(parents=True)
+        packages.symlink_to(home / "elsewhere")
+        protected, argv, _ = self.linux_mounts({packages / "standalone/x"})
+        self.assertNotIn(home / ".codex", agent.linux_parent_binds(protected))
+        self.assertIn(f"--tmpfs {dot_codex} ", argv)
+        packages.unlink()
+        protected, argv, _ = self.linux_mounts({packages / "standalone/x"})
+        self.assertNotIn(home / ".codex", agent.linux_parent_binds(protected))
+        self.assertIn(f"--tmpfs {dot_codex} ", argv)
 
 
 if __name__ == "__main__":
