@@ -85,8 +85,16 @@ skeleton directories disappear when the run ends**; create new projects inside
 an existing writable directory. `~/.ssh` and `~/.claude` are skeletons too:
 existing `known_hosts` and `~/.claude/projects` stay writable, but a new
 top-level entry there (for example a first `known_hosts`) is private to the
-run. The same applies to a directory that holds a git or SSH config target,
-for example `~/dotfiles` when `~/.gitconfig` includes `~/dotfiles/git-extra`.
+run. The same applies to **every directory between HOME and a git or SSH
+config target**, also when the target is missing. For example, when
+`~/.gitconfig` includes `~/Source/github.com/me/dotfiles/git-extra`, a
+`git clone` into `~/Source/github.com/<new-owner>/` is lost when the run ends,
+and `[includeIf "gitdir:~/work/"]` with `path = ~/work/.gitconfig` makes
+`~/work` a skeleton. An existing top-level entry in a skeleton directory is a
+bind mount: it cannot be replaced by rename or unlinked. At run start,
+agent-aws prints the skeleton directories that come from git and SSH targets.
+The reason is in the
+[threat model](threat-model.md#what-normal-use-now-breaks-inside-a-run).
 Symlink targets of protected startup files are also read-only, including targets reached through symlinked ancestors. Launch
 PATH directories and executable installation paths are protected too. This avoids the missing-file hole in `--ro-bind-try`.
 

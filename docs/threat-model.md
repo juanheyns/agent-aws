@@ -247,16 +247,26 @@ pagers or hooks (a unit test checks this).
 - Protected from these files:
     - every included file. `~` is expanded. A relative path is relative to the
       directory of the including file (its lexical and its resolved path).
-    - the `core.hooksPath` directory, when it is absolute or starts with `~`.
+    - the `core.hooksPath` and `init.templateDir` directories, when the path
+      is absolute or starts with `~`. `git init` and `git clone` copy the hooks
+      in the template directory into each new repository.
     - the program of a command when its first word is an absolute or `~` path
       (after a `!` and a leading `exec`): `credential.helper` (also per URL),
       `core.fsmonitor`, `core.sshCommand`, `core.pager`, `core.editor`,
-      `core.askPass`, `core.gitProxy`, `sequence.editor`, `gpg.program` and
-      `gpg.*.program`, `diff.external`, `diff.*.textconv`, `diff.*.command`,
+      `core.askPass`, `core.gitProxy`, `core.alternateRefsCommand`,
+      `hook.*.command`, `sequence.editor`, `gpg.program`, `gpg.*.program`,
+      `gpg.ssh.defaultKeyCommand`, `interactive.diffFilter`,
+      `diff.external`, `diff.*.textconv`, `diff.*.command`,
       `filter.*.clean`, `filter.*.smudge`, `filter.*.process`,
       `merge.*.driver`, `cmd` and `path` of `mergetool.*`, `difftool.*`,
-      `man.*` and `browser.*`, `sendemail.smtpServer`,
-      `uploadpack.packObjectsHook`, `pager.*` and `alias.*`.
+      `man.*` and `browser.*`, `sendemail.smtpServer`, `sendemail.sendmailCmd`,
+      `sendemail.toCmd`, `sendemail.ccCmd`, `sendemail.headerCmd`,
+      `trailer.*.command`, `trailer.*.cmd`, `remote.*.uploadpack`,
+      `remote.*.receivepack`, `uploadpack.packObjectsHook`, `pager.*` and
+      `alias.*`.
+    - This key list is not complete forever. New git versions add keys whose
+      value is a command, and agent-aws does not protect a key that is not in
+      the list (`GIT_COMMAND_KEYS` in `bin/agent-aws`).
 - If git is not in PATH, or a git call fails or times out, the run continues
   and prints a warning. The targets of that config are then not protected.
 
@@ -280,7 +290,7 @@ itself:
 `ProxyCommand sh -c …`, a shell function, a variable) cannot be resolved in
 general. Only its first word is checked, and a bare name resolves through the
 protected PATH. These are also not protected: a relative `core.hooksPath`
-(git resolves it in each repository), the system git config and its includes,
+or `init.templateDir` (git resolves them in each repository or working directory), the system git config and its includes,
 `%(prefix)/` include paths, repository config
 ([#7](https://github.com/juanheyns/agent-aws/issues/7)), and, on macOS, a new
 file that matches a glob `Include` directly in `~/.ssh` (on Linux, `~/.ssh` is
@@ -289,17 +299,43 @@ a private skeleton, so the new file disappears after the run).
 #### What normal use now breaks inside a run
 
 - You cannot edit an included git config file, a script in the
-  `core.hooksPath` directory, or a helper program that the config names. Also,
+  `core.hooksPath` or `init.templateDir` directory, or a helper program that the config names. Also,
   `git config --file <include target> …` fails, and a new hook cannot be added.
   Make these changes outside the sandbox.
 - A dotfiles repository that holds an include target or a helper: that file
   is read-only in a run, so a `git pull` or `checkout` there that changes it
-  fails. On Linux, the directory that holds a target becomes a private
-  skeleton: existing entries stay writable, but new top-level entries there
-  disappear when the run ends.
-- A global `core.hooksPath` or a helper path inside a project makes that path
-  read-only in the run. On Linux the project directory then becomes a private
-  skeleton too: new top-level entries in it disappear when the run ends.
+  fails.
+- **On Linux, every directory between HOME and a target becomes a private
+  skeleton**, not only the directory that holds the target. This is also true
+  when the target is missing. In each of these directories:
+    - new top-level entries are lost when the run ends. For example, with an
+      include target `~/Source/github.com/me/dotfiles/git-extra`, `~/Source`,
+      `~/Source/github.com`, `~/Source/github.com/me` and
+      `~/Source/github.com/me/dotfiles` are skeletons, so a `git clone` into
+      `~/Source/github.com/<new-owner>/` is lost when the run ends.
+    - an existing top-level entry is a bind mount, so it cannot be replaced by
+      rename and cannot be unlinked (`EBUSY`). Changes below it stay writable.
+- Common cases: `[includeIf "gitdir:~/work/"]` with
+  `path = ~/work/.gitconfig` makes `~/work` a skeleton, also when
+  `~/work/.gitconfig` does not exist yet. A global `core.hooksPath`,
+  `init.templateDir` or helper path inside a project makes that path
+  read-only, and the project directory and its parents below HOME become
+  skeletons.
+- At run start on Linux, agent-aws prints the skeleton directories that come
+  from git and SSH targets (`agent-aws: Linux: new top-level entries in these
+  directories are lost when the run ends (they hold protected git/ssh
+  targets): …`). Create new projects outside these directories, or move the
+  target out of the project tree.
+- Why every directory between HOME and the target: a read-only bind of only
+  the target, in a read-write parent, is not sufficient. Linux refuses to
+  rename a mount point (`EBUSY`), but it lets a process rename a directory
+  above a mount point. A run could rename a parent directory, create the
+  parent again and write a new file at the target path, and that file stays
+  on the host. In the skeleton chain, each directory between HOME and the
+  target is a `tmpfs` mount point, and each existing entry in it is a bind
+  mount point, so none of them can be renamed. Also, a missing target cannot
+  be bind-mounted at all. Only a private parent stops a run from creating it
+  on the host.
 - New files cannot be added to a directory that a glob `Include` reads, for
   example `~/.ssh/config.d`.
 

