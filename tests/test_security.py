@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import stat
 import tempfile
 import unittest
@@ -216,6 +217,27 @@ class ConfigTests(unittest.TestCase):
             protected = agent.protected_paths()
         self.assertIn(link, protected)
         self.assertIn(external, protected)
+
+    def test_issue4_script_python_shebangs(self):
+        cases = {
+            b"#!/opt/x/bin/python3.13\n": "/opt/x/bin/python3.13",
+            b"#!/venv/bin/python -sE\n": "/venv/bin/python",
+            b"#!/usr/bin/env -S python3 -I\n": agent.shutil.which(
+                "python3", path=agent.executable_path()),
+            b"#!/bin/sh\nexec aws\n": None,
+            b"\xcf\xfa\xed\xfe frozen binary": None,
+        }
+        for content, expected in cases.items():
+            with self.subTest(content=content):
+                script = self.home / "aws"
+                script.write_bytes(content)
+                self.assertEqual(agent.script_python(script), expected)
+        self.assertIsNone(agent.script_python(self.home / "missing"))
+
+    def test_issue4_python_paths_fail_closed(self):
+        for python in ("false", str(self.home / "missing-python")):
+            with self.subTest(python=python), self.assertRaises(SystemExit):
+                agent.python_paths(shutil.which(python) or python)
 
 
 if __name__ == "__main__":

@@ -47,6 +47,18 @@ STARTUP_PATHS = (
     ".zlogin", ".zlogout", ".bash_login", ".bash_logout",
     "Library/LaunchAgents", ".config/brnr",
     ".config/systemd/user", ".config/autostart",
+    # Configuration that later unsandboxed git, ssh and Claude Code sessions
+    # execute commands from (fsmonitor/credential helpers, ProxyCommand, hooks).
+    ".gitconfig", ".config/git",
+    ".ssh/config", ".ssh/rc", ".ssh/authorized_keys", ".ssh/authorized_keys2",
+    ".claude/settings.json", ".claude/settings.local.json",
+)
+# Asked of the interpreter named by a Python `aws` script. -I -S: no site,
+# user-site or working-directory code runs while answering.
+PYTHON_PATHS_PROBE = (
+    "import json, site, sys, sysconfig; print(json.dumps([sys.prefix, sys.base_prefix, "
+    "sys.exec_prefix, sys.base_exec_prefix, site.getusersitepackages(), "
+    "*site.getsitepackages(), *sysconfig.get_paths().values()]))"
 )
 INSTALL_DIR = SCRIPT_DIR.parent
 
@@ -369,6 +381,35 @@ def resolve_aws_cli():
     return str(Path(path).resolve())
 
 
+def script_python(path):
+    """Return the Python interpreter named by a script's shebang, or None."""
+    try:
+        with open(path, "rb") as f:
+            line = f.readline(512).decode(errors="replace")
+    except OSError:
+        return None
+    words = line[2:].split() if line.startswith("#!") else []
+    if words and Path(words[0]).name == "env":
+        words = [w for w in words[1:] if not w.startswith("-") and "=" not in w][:1]
+        words = [shutil.which(words[0], path=executable_path())] if words else []
+    if words and words[0] and Path(words[0]).name.startswith("python"):
+        return words[0]
+    return None
+
+
+def python_paths(python):
+    # A different interpreter (e.g. `pip install --user awscli`) loads its own
+    # prefix, site-packages and user site. Fail closed if they are unknown.
+    try:
+        result = subprocess.run([python, "-I", "-S", "-c", PYTHON_PATHS_PROBE],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise ValueError(result.stderr)
+        return [Path(path) for path in json.loads(result.stdout) if path]
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+        die(f"cannot determine the Python paths of the AWS CLI interpreter {python}")
+
+
 def protected_paths():
     paths = {HOME / path for path in STARTUP_PATHS}
     paths.update((INSTALL_DIR, AWS_DIR, AGENT_DIR))
@@ -396,6 +437,19 @@ def protected_paths():
                 prefix = path.resolve().parent.parent
                 paths.add(prefix if prefix != HOME else path.resolve().parent)
     paths.update((Path(sys.prefix), Path(sys.base_prefix)))
+    aws = shutil.which("aws", path=executable_path())
+    python = aws and script_python(Path(aws).resolve())
+    if python:
+        paths.add(Path(python))
+        paths.update(path for path in python_paths(python) if path.is_absolute()
+                     and path != HOME and path not in HOME.parents)
+    # Homebrew prefixes are user-writable. PATH symlinks, interpreters and the
+    # libraries they load resolve into Cellar/ and opt/, so protect every entry
+    # except var/ (service data such as databases and logs).
+    candidates = {parent for path in paths for parent in (path, *path.parents)}
+    for prefix in sorted(candidates):
+        if prefix != HOME and prefix not in HOME.parents and (prefix / "Cellar").is_dir():
+            paths.update(child for child in prefix.iterdir() if child.name != "var")
     return paths | {path.resolve() for path in paths}
 
 
