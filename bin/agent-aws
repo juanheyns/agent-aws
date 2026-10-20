@@ -544,7 +544,7 @@ def script_python(path):
     return None
 
 
-def python_paths(python):
+def python_paths(python, role="AWS CLI interpreter"):
     # A different interpreter (e.g. `pip install --user awscli`) loads its own
     # prefix, site-packages and user site. Fail closed if they are unknown.
     try:
@@ -554,7 +554,13 @@ def python_paths(python):
             raise ValueError(result.stderr)
         return [Path(path) for path in json.loads(result.stdout) if path]
     except (OSError, subprocess.SubprocessError, TypeError, ValueError):
-        die(f"cannot determine the Python paths of the AWS CLI interpreter {python}")
+        die(f"cannot determine the Python paths of the {role} {python}")
+
+
+def home_or_ancestor(path):
+    """True if path is HOME or an ancestor of it, lexically or after resolving HOME."""
+    homes = (HOME, HOME.resolve())
+    return any(path == home or path in home.parents for home in homes)
 
 
 def venv_paths(python):
@@ -571,7 +577,7 @@ def venv_paths(python):
         root = executable.parent.parent
         markers = (executable.parent / "pyvenv.cfg", root / "pyvenv.cfg")
         paths.update(markers)
-        if any(marker.is_file() for marker in markers) and root != HOME and root not in HOME.parents:
+        if any(marker.is_file() for marker in markers) and not home_or_ancestor(root):
             paths.add(root)
     return paths
 
@@ -900,8 +906,18 @@ def protected_paths(targets=None):
             # CLI/Python entry points can load sibling modules or libraries.
             # Protect their installation prefix, not just the executable inode.
             if name in ("aws", "python3"):
-                prefix = path.resolve().parent.parent
-                paths.add(prefix if prefix != HOME else path.resolve().parent)
+                # Never HOME or an ancestor of it: protect the bin dir instead,
+                # or only the executable if the bin dir is HOME or an ancestor.
+                resolved = path.resolve()
+                for candidate in (resolved.parent.parent, resolved.parent, resolved):
+                    if not home_or_ancestor(candidate):
+                        paths.add(candidate)
+                        break
+                if name == "python3" and home_or_ancestor(resolved.parent.parent):
+                    # The fallback leaves the prefix's stdlib and site-packages
+                    # open; protect the interpreter's own paths (PR #21, nit 1).
+                    paths.update(p for p in python_paths(resolved, "python3 interpreter")
+                                 if p.is_absolute() and not home_or_ancestor(p))
     paths.update((Path(sys.prefix), Path(sys.base_prefix)))
     paths.update(config_targets() if targets is None else targets)
     aws = shutil.which("aws", path=executable_path())
@@ -910,13 +926,13 @@ def protected_paths(targets=None):
         paths.add(Path(python))
         paths.update(venv_paths(python))
         paths.update(path for path in python_paths(python) if path.is_absolute()
-                     and path != HOME and path not in HOME.parents)
+                     and not home_or_ancestor(path))
     # Homebrew prefixes are user-writable. PATH symlinks, interpreters and the
     # libraries they load resolve into Cellar/ and opt/, so protect every entry
     # except var/ (service data such as databases and logs).
     candidates = {parent for path in paths for parent in (path, *path.parents)}
     for prefix in sorted(candidates):
-        if prefix != HOME and prefix not in HOME.parents and (prefix / "Cellar").is_dir():
+        if not home_or_ancestor(prefix) and (prefix / "Cellar").is_dir():
             try:
                 paths.update(child for child in prefix.iterdir() if child.name != "var")
             except OSError as exc:

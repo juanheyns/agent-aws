@@ -372,6 +372,109 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(self.home in protected, "HOME must stay writable")
         self.assertTrue(self.home / "pyvenv.cfg" in protected, "HOME/pyvenv.cfg not protected")
 
+    def protected_for_path_exe(self, home, name, target):
+        # PATH holds `name -> target`; target is a non-Python stub.
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("#!/bin/sh\n")
+        target.chmod(0o700)
+        path_dir = self.home / f"path-{name}-{len(list(self.home.iterdir()))}"
+        path_dir.mkdir()
+        (path_dir / name).symlink_to(target)
+        with mock.patch.dict(os.environ, {"PATH": str(path_dir)}), \
+             mock.patch.multiple(agent, HOME=home, python_paths=mock.Mock(return_value=[])):
+            return agent.protected_paths()
+
+    def test_issue19_prefix_guard_keeps_home_and_ancestors_writable(self):
+        # Issue #19: an `aws`/`python3` whose prefix is HOME's parent must not
+        # protect that ancestor (and so all of HOME); its bin dir is protected.
+        for name in ("aws", "python3"):
+            with self.subTest(name=name):
+                home = self.home / name / "a/home"
+                home.mkdir(parents=True)
+                bin_dir = home.parent / "bin"
+                protected = self.protected_for_path_exe(home, name, bin_dir / name)
+                self.assertFalse(home in protected, "HOME must stay writable")
+                leaked = sorted(p for p in protected if p in home.parents and self.home in p.parents)
+                self.assertEqual(leaked, [], f"HOME ancestors protected via the {name} prefix")
+                self.assertTrue(bin_dir in protected, f"{bin_dir} not protected (fallback)")
+                # Control: a prefix outside HOME's ancestors is still protected.
+                prefix = self.home / name / "opt/cli"
+                self.assertTrue(prefix in self.protected_for_path_exe(
+                    home, name, prefix / "bin" / name), f"prefix {prefix} not protected")
+
+    def test_issue19_symlinked_home_path_uses_resolved_home(self):
+        # PR #21 review round 1, nit 2: HOME `<W>/link/home` with `<W>/link -> <W>/a`
+        # and `aws -> <W>/a/bin/aws`: the resolved prefix `<W>/a` is HOME's parent.
+        for name in ("aws", "python3"):
+            with self.subTest(name=name):
+                work = self.home / f"nit2-{name}"
+                (work / "a/home").mkdir(parents=True)
+                (work / "link").symlink_to(work / "a")
+                home = work / "link/home"
+                protected = self.protected_for_path_exe(home, name, work / "a/bin" / name)
+                self.assertFalse(work / "a" in protected, "resolved HOME parent protected")
+                self.assertFalse(work / "a/home" in protected, "resolved HOME protected")
+                self.assertTrue(work / "a/bin" in protected, "bin dir not protected (fallback)")
+
+    def test_issue19_fallback_bin_dir_home_or_ancestor_protects_only_executable(self):
+        # PR #21 review round 1, nit 4: the executable sits directly in HOME's
+        # parent (`<W>/b/aws`) or in HOME (`~/aws`); PATH itself is outside HOME.
+        for name in ("aws", "python3"):
+            for layout in ("b/aws", "c/home/aws"):
+                with self.subTest(name=name, layout=layout):
+                    work = self.home / f"nit4-{name}"
+                    home = work / layout.split("/")[0] / "home"
+                    home.mkdir(parents=True, exist_ok=True)
+                    target = work / layout.replace("aws", name)
+                    protected = self.protected_for_path_exe(home, name, target)
+                    self.assertFalse(home in protected, "HOME must stay writable")
+                    self.assertFalse(home.parent in protected, "HOME parent protected")
+                    self.assertTrue(target in protected, f"{target} not protected")
+
+    def test_issue19_python3_fallback_protects_its_own_python_paths(self):
+        # PR #21 review round 1, nit 1 (option A): HOME `<W>/e/home`, PATH
+        # `python3 -> <W>/e/bin/python3`. The prefix `<W>/e` is HOME's parent,
+        # so it falls back to `<W>/e/bin`; the interpreter's own stdlib and
+        # site-packages must still be protected (HOME and `<W>/e` must not).
+        work = self.home / "nit1"
+        home, prefix = work / "e/home", work / "e"
+        home.mkdir(parents=True)
+        stdlib = prefix / "lib/python3.x"
+        user_site = home / ".local/lib/python3.x/site-packages"
+        reported = [stdlib, stdlib / "site-packages", home, prefix, user_site, Path("rel")]
+        for name in ("python3", "aws"):
+            with self.subTest(name=name):
+                target = prefix / "bin" / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("#!/bin/sh\n")
+                target.chmod(0o700)
+                path_dir = self.home / f"nit1-path-{name}"
+                path_dir.mkdir()
+                (path_dir / name).symlink_to(target)
+                probe = mock.Mock(return_value=reported)
+                with mock.patch.dict(os.environ, {"PATH": str(path_dir)}), \
+                     mock.patch.multiple(agent, HOME=home, python_paths=probe):
+                    protected = agent.protected_paths()
+                self.assertFalse(home in protected, "HOME must stay writable")
+                self.assertFalse(prefix in protected, "HOME parent protected")
+                self.assertTrue(prefix / "bin" in protected, "bin dir not protected (fallback)")
+                self.assertFalse(Path("rel") in protected, "relative probe path protected")
+                if name == "python3":
+                    self.assertTrue(stdlib in protected, f"{stdlib} not protected")
+                    self.assertTrue(stdlib / "site-packages" in protected,
+                                    "site-packages not protected")
+                    self.assertTrue(user_site in protected, "user site not protected")
+                    probe.assert_called_once_with(target.resolve(), "python3 interpreter")
+                    # The stub prints no JSON: the real probe fails closed.
+                    with mock.patch.dict(os.environ, {"PATH": str(path_dir)}), \
+                         mock.patch.object(agent, "HOME", home), \
+                         self.assertRaises(SystemExit):
+                        agent.protected_paths()
+                else:
+                    # A non-Python `aws` is not probed; its prefix dirs stay open.
+                    probe.assert_not_called()
+                    self.assertFalse(stdlib in protected, "aws prefix lib protected")
+
     def test_round4_script_python_trampoline_env_options_and_pypy(self):
         # Review round 1, finding 6.
         bindir = self.home / "pathbin"

@@ -67,9 +67,19 @@ reading tokens, the wrapper pins the AWS CLI to its resolved absolute path.
 The sandbox denies writes to every directory in the launch PATH (including
 missing earlier entries), their resolved targets, CLI/interpreter installation
 prefixes, and their ancestors. This prevents a run from planting an `aws`
-that a later run executes with the SSO token. The developer still supplies a
-trusted initial PATH and installation; this is not a scan of pre-existing
-executables for malicious content.
+that a later run executes with the SSO token. When the `aws` or `python3`
+prefix (the `../..` of the resolved executable) is HOME or an ancestor of
+HOME, only the executable's directory is protected, so HOME stays writable;
+if that directory is itself HOME or an ancestor of HOME, only the executable
+is protected. In that case, `python3`'s own install paths (stdlib,
+site-packages, as its `-I -S` probe reports them, minus HOME and its
+ancestors) are protected too; the other directories of that prefix (for
+`aws`, or non-Python files) are not. HOME is compared both as given and
+resolved. The agent-aws interpreter's own prefix (`sys.prefix`, `sys.base_prefix`) is protected
+without this HOME rule: if that prefix is HOME's parent, HOME stays
+write-denied (fail-safe).
+The developer still supplies a trusted initial PATH and installation; this
+is not a scan of pre-existing executables for malicious content.
 
 Both the source and Homebrew launchers start Python in
 [isolated mode (`-I`)](https://docs.python.org/3/using/cmdline.html#cmdoption-I),
