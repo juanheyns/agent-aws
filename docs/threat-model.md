@@ -495,7 +495,16 @@ runs. For these, use the
   and stays on the host (macOS denies it). I guess that fish creates `conf.d`,
   `functions` and `completions` at its first start, so they normally exist;
   this was not verified. The same applies to `~/.oh-my-zsh` and its `custom`
-  directory.
+  directory. **The parent bind is used only when no protected child is a
+  symlink** (as for `~/.codex` above). If `config.fish`, `conf.d`,
+  `functions` or `completions` is a symlink (existing or dangling, for
+  example into a dotfiles repo with GNU stow), `~/.config/fish` stays a
+  private skeleton on Linux and the skeleton costs apply again: **`set -U` is
+  not saved on Linux** (fish replaces `fish_variables` by rename, which fails
+  over the bind mount), and new top-level entries in `~/.config/fish` are lost
+  when the run ends. If `~/.oh-my-zsh/custom` is a symlink, `~/.oh-my-zsh`
+  stays a skeleton on Linux: `omz update` can fail when it replaces or removes
+  a top-level file of the checkout, and new top-level entries are lost.
 - `npm login`, `npm adduser`, `npm logout` and `npm config set`/`delete` fail
   (they write `~/.npmrc`). Use a project `.npmrc` or run them outside the
   sandbox.
@@ -514,7 +523,8 @@ runs. For these, use the
   `~/.vim/pack` directory that a plugin manager creates in a run) disappear
   when the run ends.
 - oh-my-zsh auto-update (`omz update`, a `git pull`) works in a run on both
-  platforms while upstream does not change the files that it tracks in
+  platforms (on Linux only when `~/.oh-my-zsh/custom` is not a symlink, see
+  above) while upstream does not change the files that it tracks in
   `custom/` (`example.zsh`, `plugins/example`, `themes/example`). If it does,
   the update fails, because `custom` is read-only.
 

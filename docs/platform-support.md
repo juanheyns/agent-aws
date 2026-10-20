@@ -118,7 +118,12 @@ the same way: `fish_variables` and the oh-my-zsh checkout are plain files in a
 read-write bind, so `set -U` and `omz update` can replace them by rename. Only
 the existing `config.fish`, `conf.d`, `functions`, `completions` and
 `~/.oh-my-zsh/custom` are bound read-only; a missing one can be created in a run
-on Linux (macOS denies it). An existing top-level entry in a skeleton directory is a
+on Linux (macOS denies it). As for `~/.codex`, this parent bind is used only
+when no protected child is a symlink: if `config.fish`, `conf.d`, `functions`,
+`completions` or `~/.oh-my-zsh/custom` is a symlink (for example into a
+dotfiles repo), that directory stays a skeleton on Linux, so **`set -U` is not
+saved** (fish replaces `fish_variables` by rename) and `omz update` can fail on
+top-level files of the checkout. An existing top-level entry in a skeleton directory is a
 bind mount: it cannot be replaced by rename or unlinked. At run start,
 agent-aws prints the skeleton directories that come from git, SSH and agent config
 targets and from the `$PYTHONSTARTUP` file.
