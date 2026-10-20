@@ -95,6 +95,15 @@ Inside the sandbox:
 
 ## What this does *not* protect against
 
+* **Host persistence outside the listed paths.** The sandbox protects known
+  startup paths (shell rc files, LaunchAgents, git/SSH and Claude Code
+  settings) and install trees (PATH directories, the Python and AWS CLI
+  installs, Homebrew prefixes). It is not host isolation. For example,
+  `~/.claude.json`, plugin directories and a repo's `.git/config` stay
+  writable. See the
+  [supported host-isolation boundary](https://juanheyns.github.io/agent-aws/threat-model/#supported-host-isolation-boundary).
+  For agents that you do not trust, use a separate OS user or a container/VM.
+
 * **Found keys and local services.** Network access remains open. Credentials
   elsewhere in a project and reachable unsandboxed daemons remain risks until
   the separate egress-lock step. Credentials also do not yet renew during a run.

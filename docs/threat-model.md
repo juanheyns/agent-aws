@@ -7,8 +7,10 @@ access to the account. The threat is the *agent* — Claude or any other
 process the developer hands credentials to — being prompt-injected, making a
 mistake, or otherwise behaving in ways the developer didn't intend.
 
-Step 1 isolates known credential stores and the listed startup paths. IAM must enforce
-read-only permissions; unrestricted network access remains a separate risk.
+Step 1 isolates known credential stores and the listed startup paths. It is
+**not** full host isolation: see the
+[supported host-isolation boundary](#supported-host-isolation-boundary). IAM must
+enforce read-only permissions; unrestricted network access remains a separate risk.
 
 ## What we're *not* defending against
 
@@ -79,10 +81,20 @@ use `python3 -I bin/agent-aws`; flags in a shebang do not apply to such calls.
 Python still executes installation-site `.pth` files in isolated mode.
 Every directory returned by `site.getsitepackages()`, its resolved target, and
 its ancestors are therefore write-protected, including Homebrew locations
-outside `sys.prefix`. The pre-existing installation remains trusted. An AWS
-CLI script using a different Python interpreter may load additional site
-paths; this separate-interpreter case is tracked in
-[issue #4](https://github.com/juanheyns/agent-aws/issues/4).
+outside `sys.prefix`. The pre-existing installation remains trusted. When the
+resolved `aws` is a Python script for a different interpreter (for example
+`pip install --user awscli`), the wrapper asks that interpreter (`-I -S`) for
+its prefixes, site-packages and user site and protects them too. If it cannot
+answer, the run fails closed. `aws` wrappers that are not Python scripts (asdf
+or mise shims, shell scripts) are not followed
+([#12](https://github.com/juanheyns/agent-aws/issues/12)).
+
+Homebrew prefixes are user-writable. PATH symlinks such as
+`/opt/homebrew/bin/git` resolve into `Cellar/`. The Homebrew Python loads
+shared libraries through `opt/` (for example `liblzma` and `libzstd`) before the
+wrapper reads the SSO token. Every top-level entry of a Homebrew prefix (a
+directory with `Cellar/`) above a protected path is therefore write-protected,
+except `var/`, which holds service data.
 
 ### 3. Filesystem sandbox
 
@@ -158,16 +170,95 @@ agent-aws run -- /bin/sh -c '
 All four should fail — the first two with kernel `EPERM`, the last two with
 IAM `AccessDenied`.
 
+## Supported host-isolation boundary
+
+The threat here is *persistence*: a run writes something that a later,
+unsandboxed process (the developer's shell, git, ssh, an agent session, or the
+next `agent-aws run` wrapper) executes. That process can read
+`~/.aws/sso/cache` and get admin credentials. Step 1 blocks this for a fixed
+list of known paths. It does not block it in general.
+
+### Protected (write-denied on macOS, read-only or private on Linux)
+
+- Credential stores: `~/.aws` and `~/.agent-aws` (also unreadable), and other
+  runs' `/tmp/agent-aws.*` directories.
+- Shell startup files: `.zshrc`, `.zprofile`, `.zshenv`, `.zlogin`, `.zlogout`,
+  `.bashrc`, `.bash_profile`, `.bash_login`, `.bash_logout`, `.profile`.
+- Launch and autostart directories: `~/Library/LaunchAgents`,
+  `~/.config/systemd/user`, `~/.config/autostart`, and `~/.config/brnr`.
+- Git and SSH configuration: `~/.gitconfig`, `~/.config/git`, `~/.ssh/config`,
+  `~/.ssh/rc`, `~/.ssh/authorized_keys`, `~/.ssh/authorized_keys2`. Agents can
+  still read them, run git, and append to `~/.ssh/known_hosts`.
+- Claude Code settings and hooks: `~/.claude/settings.json` and
+  `~/.claude/settings.local.json`. Claude Code session state
+  (`~/.claude/projects` and similar) stays writable. Settings changes made
+  inside a run fail; change them outside the sandbox.
+- Executables and code that the wrapper or a later shell runs: every
+  launch-PATH directory, the agent-aws installation and launcher, the Python
+  interpreter, its site-packages and user site, the `aws` and `python3`
+  installation prefixes, the interpreter paths of a Python `aws` script, and
+  each Homebrew prefix except `var/`.
+- For each path: its resolved symlink target. On macOS every ancestor is also
+  protected against rename.
+
+Missing paths in this list cannot be created: macOS denies the write, and on
+Linux the new file is private to the run.
+
+### Not protected
+
+The [#4 assessment](https://github.com/juanheyns/agent-aws/pull/5) confirmed
+with disposable fixtures that a run can still write these. Each one is tracked:
+
+| Class | Example that stays writable | Issue |
+|---|---|---|
+| Install targets of symlinked PATH executables | `~/.local/share/claude/versions/*` behind `~/.local/bin/claude` | [#13](https://github.com/juanheyns/agent-aws/issues/13) |
+| Git/SSH include targets and helper programs | `include.path` targets, `core.hooksPath` scripts | [#6](https://github.com/juanheyns/agent-aws/issues/6) |
+| Repository-local configuration | `.git/config` (`core.fsmonitor`), `.git/hooks`, project `.claude/settings.json`, `.envrc` | [#7](https://github.com/juanheyns/agent-aws/issues/7) |
+| Agent config that the agent writes itself | `~/.claude.json` (`mcpServers`), `~/.claude/plugins`, `~/.claude/CLAUDE.md`, `~/.codex/config.toml` | [#8](https://github.com/juanheyns/agent-aws/issues/8) |
+| Code sourced by startup files, other shells, tool config, other bin dirs | `~/.oh-my-zsh/custom`, `~/.config/fish`, `~/.npmrc`, `~/bin` not in PATH | [#9](https://github.com/juanheyns/agent-aws/issues/9) |
+| Mutable dependencies outside protected trees | Homebrew `var/`, new prefix entries, nvm, uv, conda, mise | [#10](https://github.com/juanheyns/agent-aws/issues/10) |
+| macOS services that write for the caller, app autostart | cfprefsd (Terminal/iTerm2 startup command), Login Items, launchd jobs, iTerm2 AutoLaunch | [#11](https://github.com/juanheyns/agent-aws/issues/11) |
+| `aws` wrappers that are not Python scripts | asdf/mise shims, shell wrappers | [#12](https://github.com/juanheyns/agent-aws/issues/12) |
+
+The working tree is output of an untrusted process. Review it before you run
+git, build tools, or an agent in it outside the sandbox. A later unsandboxed
+invocation can also use a different PATH from the one that was protected.
+Files that the sandbox can read, such as SSH private keys, are not protected
+against exfiltration while the network is open.
+
+### Decision: deny-list, not host isolation
+
+We compared three options:
+
+1. **Wider protected roots** (for example all of HOME, `~/.local` or
+   `~/Library`). This breaks agents, which must write caches, session state
+   and the working tree. Also, the list of roots that later processes execute
+   has no end: each entry in the table above is a different tool's
+   convention. We use wider roots only where a root is an install tree that a
+   run does not need to write: the Homebrew prefix without `var/`. Installs
+   into protected PATH directories already fail inside a run.
+2. **Separate OS user.** The agent runs as a user that has no write access to
+   the developer's HOME, keychain, Homebrew prefix or launchd/cfprefsd domain.
+   This removes the whole class, not a list of paths.
+3. **Container or VM** (rootless podman, Lima, Apple `container`). Like a
+   separate user, and it also separates the kernel view. The cost is a
+   project mount and agent setup inside the box.
+
+Step 1 stays a deny-list of known startup paths. It is documented as
+protection for those paths, not as host isolation. It is a good default for an
+agent that you mostly trust and want to stop from making mistakes or from
+being prompt-injected into the most common persistence paths. For agents that
+you do not trust, use a separate OS user or a container/VM as the boundary
+([#14](https://github.com/juanheyns/agent-aws/issues/14)). The egress lock
+(step 3) is still necessary in both cases.
+
 ## Out of scope
 
 These are real risks `agent-aws` does *not* address:
 
-- **Other persistence classes.** Git/SSH configuration, agent settings and
-  hooks, executable directories outside the launch PATH, and mutable Homebrew
-  dependencies outside protected installation prefixes remain gaps. The PATH
-  used by a later unsandboxed invocation can also differ. This is protection
-  for the listed paths, not complete host isolation. Follow-up:
-  [remaining host persistence paths](https://github.com/juanheyns/agent-aws/issues/4).
+- **Persistence outside the listed paths.** See
+  [not protected](#not-protected) above. This is protection for the listed
+  paths, not complete host isolation.
 
 - **Found credentials and local services.** Network access remains open.
   Credentials in project files, metadata services, and reachable unsandboxed

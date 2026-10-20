@@ -31,6 +31,15 @@ Switching to *deny by default + explicit allows* would also let us:
 
 Worth the complexity once the basics are solid.
 
+## Strong host boundary
+
+Step 1 protects a list of known startup paths; it is not host isolation (see
+the [threat model](threat-model.md#supported-host-isolation-boundary)). For
+agents that are not trusted, document and support running the agent as a
+separate OS user or in a container/VM, with only the project and the per-run
+credential directory shared
+([#14](https://github.com/juanheyns/agent-aws/issues/14)).
+
 ## SCP / permission-boundary template
 
 A Service Control Policy template that denies destructive actions for any

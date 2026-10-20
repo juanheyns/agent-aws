@@ -27,10 +27,14 @@ Reads and writes return `Operation not permitted` (`EPERM`). Writes to shell
 startup files (`.zshrc`, `.zprofile`, `.zshenv`, `.zlogin`, `.zlogout`,
 `.bashrc`, `.bash_profile`, `.bash_login`, `.bash_logout`, `.profile`),
 `~/Library/LaunchAgents`, `~/.config/brnr`, `~/.config/systemd/user`,
-`~/.config/autostart`, and the resolved installation directory are denied.
-Generated rules protect conventional paths, resolved targets, and every
-ancestor against rename. Launch PATH directories, launcher paths, and the
-Python/AWS CLI installation prefixes are protected too.
+`~/.config/autostart`, git and SSH configuration (`~/.gitconfig`,
+`~/.config/git`, `~/.ssh/config`, `~/.ssh/rc`, `~/.ssh/authorized_keys`,
+`~/.ssh/authorized_keys2`), Claude Code settings (`~/.claude/settings.json`,
+`~/.claude/settings.local.json`), and the resolved installation directory are
+denied. Generated rules protect conventional paths, resolved targets, and every
+ancestor against rename. Launch PATH directories, launcher paths, the
+Python/AWS CLI installation prefixes (including the interpreter of a Python
+`aws` script), and Homebrew prefixes except `var/` are protected too.
 Other runs' files are unreadable and unwritable; limited pathname metadata
 is allowed so shell globs report denied files rather than silently skipping them.
 `open`, `osascript`, `launchctl`, mounts, and the Launch Services / quarantine
@@ -58,15 +62,18 @@ current run's credentials mounted back in. `~/.aws` and `~/.agent-aws` are
 hidden behind empty, read-only mounts. PID, IPC and UTS namespaces are private.
 Networking is still shared; the egress lock is a separate future step.
 
-Existing shell startup files, `~/.config/brnr`, `~/Library/LaunchAgents`, and
-the installation directory are mounted read-only. A private directory skeleton
+Existing shell startup files, `~/.config/brnr`, `~/Library/LaunchAgents`, git
+and SSH configuration, Claude Code settings, and the installation directory
+are mounted read-only. A private directory skeleton
 for HOME and the parents of protected paths prevents a missing protected path
 from being created persistently on the host. Linux also protects systemd user
 units and autostart entries. Existing ordinary children (such as project
 directories) are bound read-write. **New entries in these
 skeleton directories disappear when the run ends**; create new projects inside
-an existing writable directory. Symlink targets of protected startup files are
-also read-only, including targets reached through symlinked ancestors. Launch
+an existing writable directory. `~/.ssh` and `~/.claude` are skeletons too:
+existing `known_hosts` and `~/.claude/projects` stay writable, but a new
+top-level entry there (for example a first `known_hosts`) is private to the
+run. Symlink targets of protected startup files are also read-only, including targets reached through symlinked ancestors. Launch
 PATH directories and executable installation paths are protected too. This avoids the missing-file hole in `--ro-bind-try`.
 
 ### Unprivileged user namespaces
@@ -116,7 +123,13 @@ site-packages directory is write-protected to prevent `.pth` startup injection.
 Installation-site directories reported by `site.getsitepackages()` are also
 protected, even outside the interpreter prefix and through symlink targets:
 `-I` still executes `.pth` files from those directories.
-All launch-PATH directories are read-only: self-updates and global package
-installs into those directories must run outside the sandbox. Empty or `.`
+All launch-PATH directories and Homebrew prefixes (except `var/`) are
+read-only: self-updates, `brew install`, and global package installs into those
+directories must run outside the sandbox. Changes to protected git, SSH and
+Claude Code settings also fail inside a run. Empty or `.`
 PATH entries also protect the current directory and produce a warning; use
 absolute entries to avoid making a working directory read-only.
+
+These protections cover a list of known paths, not the whole host. See the
+[supported host-isolation boundary](threat-model.md#supported-host-isolation-boundary)
+for what is not protected.
