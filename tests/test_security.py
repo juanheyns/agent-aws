@@ -932,6 +932,27 @@ class Issue9StartupCodeTests(unittest.TestCase):
             self.assertNotIn(f"{self.home}/{name}", joined, name)
         for name in (".config/other", ".vim/plugin"):
             self.assertIn(f"--bind {self.home}/{name} {self.home}/{name} ", joined, name)
+        # Review round 2, R2-1: a symlinked protected child (absolute
+        # config.fish link, relative custom dir link into a dotfiles repo)
+        # keeps the skeleton for that directory only.
+        self.write("dotfiles/fish/config.fish", "# dotfiles\n")
+        self.write("dotfiles/omz-custom/x.zsh", "# dotfiles\n")
+        fish, omz = self.home / ".config/fish", self.home / ".oh-my-zsh"
+        (fish / "config.fish").unlink()
+        (fish / "config.fish").symlink_to(self.home / "dotfiles/fish/config.fish")
+        joined = " ".join(agent.build_sandbox_argv_linux(self.home / "creds")) + " "
+        self.assertIn(f"--tmpfs {fish} ", joined)
+        self.assertNotIn(f"--bind {fish} {fish} ", joined)
+        self.assertIn(f"--ro-bind {self.home}/dotfiles/fish/config.fish {fish}/config.fish ", joined)
+        self.assertIn(f"--bind {omz} {omz} ", joined)
+        shutil.rmtree(omz / "custom")
+        (omz / "custom").symlink_to("../dotfiles/omz-custom")
+        joined = " ".join(agent.build_sandbox_argv_linux(self.home / "creds")) + " "
+        self.assertIn(f"--tmpfs {omz} ", joined)
+        self.assertNotIn(f"--bind {omz} {omz} ", joined)
+        self.assertIn(f"--ro-bind {self.home}/dotfiles/omz-custom {omz}/custom ", joined)
+        # Skeleton: the existing oh-my-zsh.sh is a writable mount point.
+        self.assertIn(f"--bind {omz}/oh-my-zsh.sh {omz}/oh-my-zsh.sh ", joined)
 
 
 if __name__ == "__main__":
