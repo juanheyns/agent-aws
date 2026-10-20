@@ -55,7 +55,9 @@ install paths are protected; see the
 Every symlink on the PATH chain of `agent-aws`, `aws` and `python3` (the link itself, not
 its directory) is protected too. So is the install location of the run's own
 command, for example `~/.local/share/claude` behind `~/.local/bin/claude`,
-but never HOME, `/`, an ancestor of HOME or the working tree; see
+but never HOME, `/`, an ancestor of HOME or the working tree, and never a
+direct child of HOME as its prefix (a plain `~/.local/bin/goose` protects
+only `~/.local/bin`); see
 [the run's own command](threat-model.md#the-runs-own-command). Auto-update of
 `claude` or `codex` inside a run therefore fails: update them outside the
 sandbox.
@@ -141,10 +143,14 @@ saved** (fish replaces `fish_variables` by rename) and `omz update` can fail on
 top-level files of the checkout. An existing top-level entry in a skeleton directory is a
 bind mount: it cannot be replaced by rename or unlinked. At run start,
 agent-aws prints the skeleton directories that come from git, SSH and agent config
-targets and from the `$PYTHONSTARTUP` file.
+targets, the `$PYTHONSTARTUP` file, the run's own command and the PATH symlinks
+of `agent-aws`, `aws` and `python3`.
 The reason is in the
 [threat model](threat-model.md#what-normal-use-now-breaks-inside-a-run).
-Symlink targets of protected startup files are also read-only, including targets reached through symlinked ancestors. Launch
+Symlink targets of protected startup files are also read-only, including targets reached through symlinked ancestors. A
+protected PATH symlink whose target is HOME or an ancestor of HOME is not
+mounted from its target: it is a private copy of the link, so a repoint in a
+run is lost when the run ends. Launch
 PATH directories and executable installation paths are protected too. This avoids the missing-file hole in `--ro-bind-try`.
 
 ### Unprivileged user namespaces

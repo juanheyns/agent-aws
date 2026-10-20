@@ -83,9 +83,13 @@ links in the middle (for example `current -> releases/1`), so a run cannot
 repoint a link in a writable directory (`<PATH>/aws -> ~/link -> …`) to its
 own file ([#23](https://github.com/juanheyns/agent-aws/issues/23)). The link
 itself is protected, not its directory and not its target (a `/tmp` link
-does not protect `/private/tmp`). Links that are HOME or an ancestor of HOME,
-or whose target is, are skipped (for example `/var -> private/var` on macOS,
-or a symlinked HOME). More than 40 links on one path fail closed.
+does not protect `/private/tmp`). Links that are HOME or an ancestor of HOME
+are skipped (a symlinked HOME). A link whose target is HOME or an ancestor of
+HOME is protected too (for example `~/d/h -> ~`, or the root-owned
+`/var -> private/var` on macOS): macOS denies writes to the link path only,
+and Linux mounts a private copy of the link (`--symlink`) in its skeleton
+directory, never its target, so HOME stays writable and a repoint in a run is
+lost when the run ends. More than 40 links on one path fail closed.
 The developer still supplies a trusted initial PATH and installation; this
 is not a scan of pre-existing executables for malicious content.
 
@@ -442,15 +446,27 @@ protects:
 - Every symlink on the way to the executable (file links and directory links
   in the middle), as for `aws` above.
 - The first of its resolved install prefix (`../..`), bin directory and
-  executable that is allowed by the rules below.
+  executable that is allowed by the rules below. The prefix is never a
+  direct child of HOME (as given or resolved), such as `~/.local`,
+  `~/.cargo`, `~/go` or `~/.bun`: then the bin directory is used. (`aws` and
+  `python3` keep the rule above, so `~/.local/bin/aws` protects `~/.local`.)
 
 Examples: `~/.local/bin/claude -> ~/.local/share/claude/versions/2.1.301`
 protects the link and `~/.local/share/claude`. The Codex standalone install
 (`~/.local/bin/codex -> ~/.codex/packages/standalone/current/bin/codex`, with
 `current -> releases/0.160.1-aarch64-apple-darwin`) protects the link,
-`current` and `releases/0.160.1-aarch64-apple-darwin`.
+`current` and `releases/0.160.1-aarch64-apple-darwin`. A plain file
+`~/.local/bin/goose` protects only `~/.local/bin`; `cargo install` and
+`go install` commands (`~/.cargo/bin/<x>`, `~/go/bin/<x>`) protect only
+`~/.cargo/bin` or `~/go/bin`.
 
-Never protected (a link to one of them is skipped too):
+A link on the chain is skipped when its target is in the working tree or is
+an ancestor of it (but not HOME or an ancestor of HOME): the run can write in
+the working tree anyway, and on Linux the protected link would mount its
+target, and so the working tree, read-only. A link to HOME or an ancestor of
+HOME is protected, as for `aws` above.
+
+Never protected:
 
 - HOME, `/` and the other ancestors of HOME (as given and resolved). So
   `/bin/sh` protects `/bin` on macOS and `/usr` on Linux, and `~/tool`
@@ -563,20 +579,30 @@ Still not protected:
   `~/.local/share/claude/versions` or `~/.codex/packages/standalone` and
   repoints the link). Update them outside the sandbox. On macOS a new
   `releases/<version>` directory can still be created next to the protected
-  one, but `current` cannot be repointed. `npm i -g`, `pip install` or
-  `brew upgrade` of the run's command in a run also fail when they write into
-  its install prefix.
+  one, but `current` cannot be repointed. What becomes read-only is exactly
+  the install location above. For a plain file in `~/.local/bin` (or
+  `~/.cargo/bin`, `~/go/bin`) that is only the bin directory, which is
+  already protected as a PATH directory: no new cost. A deeper install
+  prefix is read-only in the run, for example `~/.local/share/claude`,
+  `~/.codex/packages/standalone/releases/<version>`, or
+  `~/.nvm/versions/node/v20` for a plain `~/.nvm/versions/node/v20/bin/node`
+  (so `npm i -g` into it fails). `npm i -g`, `pip install` or `brew upgrade`
+  of the run's command in a run fail when they write into that prefix.
 - **On Linux, every directory between HOME and the run's command or a
   protected PATH chain link becomes a private skeleton**, as for a git target
   above: for `claude`, `~/.local/share` (new top-level entries in it are lost
   when the run ends; existing entries cannot be renamed); for `codex`,
   `~/.codex/packages`, `~/.codex/packages/standalone` and
   `~/.codex/packages/standalone/releases` (`~/.codex` itself stays a
-  read-write bind, see above). The note at run start lists them for the run's
-  command; it does not list the skeletons of an `aws`/`python3` chain link
-  (for example `~/d` for `~/d/link`). On Linux a protected directory link is
-  mounted read-only from its target, so its target directory is read-only in
-  the run too (on macOS only the link is protected).
+  read-write bind, see above); for `~/.nvm/versions/node/v20` above,
+  `~/.nvm`, `~/.nvm/versions` and `~/.nvm/versions/node`. A plain file in
+  `~/.local/bin` adds none: `~/.local` is already a skeleton because
+  `~/.local/bin` is a PATH directory. The note at run start lists them, also
+  the skeletons of an `agent-aws`/`aws`/`python3` chain link (for example
+  `~/d` for `~/d/link`). On Linux a protected directory link is mounted
+  read-only from its target, so its target directory is read-only in the run
+  too (on macOS only the link is protected). A link to HOME or an ancestor of
+  HOME is the exception: it is a private copy of the link (see above).
 - You cannot edit fish `config.fish`, `conf.d`, `functions` or `completions`;
   `fisher install`/`update` and `funcsave` fail. `set -U` works on both
   platforms: on Linux, `~/.config/fish` is bound read-write (like `~/.codex`)

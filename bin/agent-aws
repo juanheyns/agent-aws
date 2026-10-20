@@ -607,27 +607,39 @@ def symlink_chain(path):
     return links
 
 
-def chain_links(executable, excluded):
+def home_link(path):
+    """True if path is a symlink to HOME or an ancestor of HOME. Linux mounts
+    a protected one as a private --symlink, never from its target: that would
+    show the real HOME (with ~/.aws) at the link and bind HOME read-only."""
+    return path.is_symlink() and home_or_ancestor(path.resolve())
+
+
+def chain_links(executable, excluded, skip_target=None):
     """The symlinks on the chain of executable that are not excluded (#23).
 
-    Links whose target is excluded are skipped too: Linux binds a link's
-    target read-only. Final paths: callers must not resolve them again, so
-    that a link is protected itself, not its target (a `/tmp` link must not
-    protect `/private/tmp`).
+    Also a link to HOME or an ancestor of HOME (`~/d/h -> ~`): see
+    home_link(). skip_target: a link whose resolved target it matches is
+    skipped (the working tree of the run's command). Final paths: callers
+    must not resolve them again, so that a link is protected itself, not its
+    target (a `/tmp` link must not protect `/private/tmp`).
     """
-    return {link for link in symlink_chain(executable)
-            if not excluded(link) and not excluded(link.resolve())}
+    return {link for link in symlink_chain(executable) if not excluded(link)
+            and not (skip_target and skip_target(link.resolve()))}
 
 
-def install_paths(executable, excluded):
+def install_paths(executable, excluded, skip_target=None, skip_prefix=None):
     """Paths that protect an installed executable against replacement.
 
     Its chain_links() and the first of its resolved prefix (`../..`), bin dir
-    and executable that is not excluded (#19). All paths are final.
+    and executable that is not excluded (#19); skip_prefix can rule out the
+    prefix only. All paths are final.
     """
-    paths = chain_links(executable, excluded)
+    paths = chain_links(executable, excluded, skip_target)
     resolved = executable.resolve()
-    for candidate in (resolved.parent.parent, resolved.parent, resolved):
+    candidates = (resolved.parent.parent, resolved.parent, resolved)
+    if skip_prefix and skip_prefix(candidates[0]):
+        candidates = candidates[1:]
+    for candidate in candidates:
         if not excluded(candidate):
             paths |= home_forms(candidate)
             break
@@ -658,18 +670,41 @@ def command_paths(program):
     The symlinks on its PATH chain and its prefix, bin dir or executable
     (install_paths()), but never HOME, `/` or another ancestor of HOME, and
     nothing that is a working tree, an ancestor of one or inside one (a
-    `./script` in the project). Final paths: do not resolve them again.
+    `./script` in the project); a link into one is skipped too, unless it
+    points to HOME or an ancestor of HOME. The prefix is never a direct
+    child of HOME (`~/.local`, `~/.cargo`, `~/go`): a plain file in
+    `~/.local/bin` protects that bin dir only. Final paths: do not resolve
+    them again.
     """
     found = shutil.which(program, path=executable_path())
     if not found:
         return set()
     trees = working_trees()
 
-    def excluded(path):
-        return home_or_ancestor(path) or any(
-            path == tree or path in tree.parents or tree in path.parents for tree in trees)
+    def in_tree(path):
+        return any(path == tree or path in tree.parents or tree in path.parents for tree in trees)
 
-    return install_paths(Path(found).absolute(), excluded)
+    def excluded(path):
+        return home_or_ancestor(path) or in_tree(path)
+
+    def skip_target(path):
+        return in_tree(path) and not home_or_ancestor(path)
+
+    def skip_prefix(path):
+        # path is resolved; HOME as given and resolved.
+        return path.parent in (HOME, HOME.resolve())
+
+    return install_paths(Path(found).absolute(), excluded, skip_target, skip_prefix)
+
+
+def tool_chain_links():
+    """The PATH chain links of agent-aws, python3 and aws (#23); final paths."""
+    links = set()
+    for name in ("agent-aws", "python3", "aws"):
+        executable = shutil.which(name, path=executable_path())
+        if executable:
+            links |= chain_links(Path(executable).absolute(), home_or_ancestor)
+    return links
 
 
 def venv_paths(python):
@@ -994,11 +1029,13 @@ def config_targets():
 def protected_paths(targets=None, command=frozenset()):
     """Paths that the sandbox write-protects, with their resolved targets.
 
-    command: final paths from command_paths() (#13); they and the PATH chain
-    links of `aws` and `python3` (#23) are not resolved again.
+    command: final paths from command_paths() (#13); they and
+    tool_chain_links() (#23) are not resolved again.
     """
     paths = {HOME / path for path in STARTUP_PATHS}
-    final = set(command)
+    # Every symlink on the way to agent-aws, python3 and aws too, so that a
+    # link in a writable directory (~/link) cannot be repointed (#23).
+    final = set(command) | tool_chain_links()
     paths.update((INSTALL_DIR, AWS_DIR, AGENT_DIR))
     # -I prevents user-site startup code; also prevent planting it for other
     # unsandboxed Python entry points using this interpreter.
@@ -1018,9 +1055,6 @@ def protected_paths(targets=None, command=frozenset()):
         if executable:
             path = Path(executable).absolute()
             paths.add(path)
-            # Every symlink on the way too, so that a link in a writable
-            # directory (~/link) cannot be repointed (#23).
-            final |= chain_links(path, home_or_ancestor)
             # CLI/Python entry points can load sibling modules or libraries.
             # Protect their installation prefix, not just the executable inode.
             if name in ("aws", "python3"):
@@ -1125,7 +1159,10 @@ def linux_home_mounts(protected=None):
         for child in sorted(directory.iterdir()):
             if child in private:
                 continue
-            if child in protected:
+            if child in protected and home_link(child):
+                # A private copy: a repoint is lost when the run ends.
+                argv.extend(["--symlink", os.readlink(child), str(child)])
+            elif child in protected:
                 argv.extend(["--ro-bind", str(child.resolve()), str(child)])
             elif child in parent_binds:
                 # Mount points: the directory and its existing protected
@@ -1156,7 +1193,7 @@ def linux_home_mounts(protected=None):
         argv += ["--tmpfs", str(path), "--remount-ro", str(path)]
     # Include targets with symlinked ancestors, not only final-component links.
     for path in sorted(protected - private):
-        if path.exists() and path.resolve() != path:
+        if path.exists() and path.resolve() != path and not home_link(path):
             argv += ["--ro-bind", str(path.resolve()), str(path.resolve())]
     return argv
 
@@ -1164,8 +1201,8 @@ def linux_home_mounts(protected=None):
 def linux_target_skeletons(protected, targets):
     """Directories that linux_home_mounts() makes private skeletons only
     because a git/ssh (#6) or agent (#8) config target, the $PYTHONSTARTUP
-    file (#9) or the install location of the run's command (#13) is below
-    them.
+    file (#9), the install location of the run's command (#13) or a PATH
+    chain link of agent-aws, python3 or aws (#23) is below them.
 
     Every directory between HOME and a target is a skeleton (also when the
     target is missing): new top-level entries in it are lost when the run
@@ -1189,8 +1226,8 @@ def linux_skeleton_note(protected, targets):
     if skeletons:
         names = ", ".join(f"~/{path.relative_to(HOME)}" for path in skeletons)
         print("agent-aws: Linux: new top-level entries in these directories are lost when "
-              "the run ends (they hold protected git/ssh/agent config, $PYTHONSTARTUP or "
-              f"the run's command): {names}", file=sys.stderr)
+              "the run ends (they hold protected git/ssh/agent config, $PYTHONSTARTUP, "
+              f"the run's command or PATH symlinks): {names}", file=sys.stderr)
 
 
 def build_sandbox_argv_linux(creds_dir, protected=None):
@@ -1262,7 +1299,7 @@ def cmd_run(args):
     command = command_paths(args.cmd[0])
     protected = protected_paths(targets, command)
     if IS_LINUX:
-        linux_skeleton_note(protected, targets | command)
+        linux_skeleton_note(protected, targets | command | tool_chain_links())
 
     creds_dir = Path(tempfile.mkdtemp(prefix="agent-aws.", dir="/tmp"))
     cred_file = creds_dir / "credentials"

@@ -526,10 +526,71 @@ class ConfigTests(unittest.TestCase):
                         self.assertTrue(work / "opt/x" in protected, "prefix not protected")
                         self.assertFalse(work / "opt" in protected, "prefix parent protected")
 
+    def home_link_fixture(self, name):
+        # PR #25 review 1, finding 1: `<W>/p/<name> -> ~/d/h/opt/bin/<name>`
+        # with `~/d/h -> ~`. HOME is `<W>/hl/home` with `<W>/hl -> <W>/real`.
+        work = self.home / f"pr25-{name}"
+        (work / "real/home/d").mkdir(parents=True)
+        (work / "real/home/project").mkdir()
+        (work / "hl").symlink_to(work / "real")
+        home, real = work / "hl/home", work / "real/home"
+        target = real / "opt/bin" / name
+        target.parent.mkdir(parents=True)
+        target.write_text("#!/bin/sh\n")
+        target.chmod(0o700)
+        (real / "d/h").symlink_to(home)
+        (work / "p").mkdir()
+        (work / "p" / name).symlink_to(home / "d/h/opt/bin" / name)
+        return work, home, real
+
+    def home_link_protected(self, name, command):
+        work, home, real = self.home_link_fixture(name)
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(home / "project")
+        with mock.patch.dict(os.environ, {"PATH": str(work / "p")}), \
+             mock.patch.multiple(agent, HOME=home, AWS_DIR=home / ".aws", AGENT_DIR=home / ".agent-aws",
+                                 python_paths=mock.Mock(return_value=[])):
+            paths = agent.command_paths(name) if command else set()
+            protected = agent.protected_paths(set(), paths)
+            argv = agent.linux_home_mounts(protected)
+        return work, home, real, paths, protected, argv
+
+    def test_pr25_link_to_home_on_chain_is_protected(self):
+        # A link whose target is HOME (or an ancestor of HOME) was skipped, so
+        # run 1 could repoint `~/d/h` and run 2 pinned another `aws`.
+        for name, command in (("aws", False), ("python3", False), ("claude", True)):
+            with self.subTest(name=name):
+                work, home, real, paths, protected, _ = self.home_link_protected(name, command)
+                self.assertTrue(real / "d/h" in protected, "~/d/h (resolved parent) not protected")
+                self.assertTrue(home / "d/h" in protected, "~/d/h (HOME-lexical) not protected")
+                if command:
+                    self.assertTrue({real / "d/h", home / "d/h"} <= paths, "command_paths() skips ~/d/h")
+                for path in (home, real, work / "hl", work / "real", work, *work.parents,
+                             home / "d", real / "d"):
+                    self.assertFalse(path in protected, f"{path} (HOME, an ancestor or a link's dir) protected")
+
+    def test_pr25_linux_link_to_home_is_private_symlink(self):
+        # Pure argv check (also on macOS): a protected link to HOME must not
+        # be mounted from its target (that would show the real HOME, with
+        # ~/.aws, at the link, and `--ro-bind HOME HOME`).
+        for name, command in (("aws", False), ("claude", True)):
+            with self.subTest(name=name):
+                work, home, real, _, _, argv = self.home_link_protected(name, command)
+                homes = {home, real, *home.parents, *real.parents}
+                ro_binds = [(argv[i + 1], argv[i + 2]) for i, arg in enumerate(argv) if arg == "--ro-bind"]
+                for source, destination in ro_binds:
+                    self.assertNotIn(Path(source), homes, f"--ro-bind {source} {destination}")
+                joined = " ".join(argv) + " "
+                self.assertIn(f"--tmpfs {home}/d ", joined)
+                self.assertIn(f"--symlink {home} {home}/d/h ", joined)
+
     @unittest.skipUnless(Path("/var").is_symlink(), "macOS /var -> private/var")
     def test_issue23_system_link_to_home_ancestor_not_protected(self):
         # `/var -> private/var` is on the chain when PATH uses the lexical
-        # /var path; its target is an ancestor of HOME, so it is skipped.
+        # /var path; its target is an ancestor of HOME. The link itself may be
+        # protected (PR #25 review 1: Seatbelt matches resolved paths, and
+        # /var is root-owned), but never its target /private/var.
         if not str(self.home).startswith("/private/var/"):
             self.skipTest("temp dir is not below /private/var")
         home = self.home / "var-home"
@@ -541,7 +602,6 @@ class ConfigTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PATH": str(bin_dir)[len("/private"):]}), \
              mock.patch.multiple(agent, HOME=home, python_paths=mock.Mock(return_value=[])):
             protected = agent.protected_paths()
-        self.assertFalse(Path("/var") in protected, "/var link protected")
         self.assertFalse(Path("/private/var") in protected, "/private/var protected")
         self.assertTrue(self.home / "var-opt/x" in protected, "prefix not protected")
 
@@ -856,7 +916,7 @@ class Issue6ResolverTests(unittest.TestCase):
         note = error.getvalue()
         self.assertIn("agent-aws: Linux: new top-level entries in these directories are lost "
                       "when the run ends (they hold protected git/ssh/agent config, "
-                      "$PYTHONSTARTUP or the run's command): ", note)
+                      "$PYTHONSTARTUP, the run's command or PATH symlinks): ", note)
         self.assertIn("~/Source, ~/Source/github.com, ~/Source/github.com/me, "
                       "~/Source/github.com/me/dotfiles, ~/work\n", note)
         # Skeletons that STARTUP_PATHS make anyway, and read-only
@@ -1187,6 +1247,24 @@ class Issue13CommandTests(unittest.TestCase):
             self.assertNotIn(path, paths, f"{path} protected")
         for tree in trees:
             self.assertFalse(any(tree in path.parents for path in paths), f"path inside {tree} protected")
+
+    def test_pr25_plain_command_in_home_tool_prefix_protects_bin_dir(self):
+        # PR #25 review 1, finding 2: a plain file in `~/.local/bin`,
+        # `~/.cargo/bin`, `~/go/bin` or `~/.bun/bin` must not make the whole
+        # tool prefix (a direct child of HOME) read-only, only its bin dir.
+        home = self.home
+        bins = (".local/bin", ".cargo/bin", "go/bin", ".bun/bin")
+        for index, bin_dir in enumerate(bins):
+            self.executable(f"{bin_dir}/tool{index}")
+        with mock.patch.dict(os.environ, {"PATH": ":".join(str(home / b) for b in bins)}):
+            for index, bin_dir in enumerate(bins):
+                with self.subTest(bin_dir=bin_dir):
+                    paths = agent.command_paths(f"tool{index}")
+                    self.assertEqual(paths, {home / bin_dir})
+                    self.assertNotIn(home / bin_dir.split("/")[0], paths)
+        # aws and python3 keep the #19/#21 rule: their `../..` is protected.
+        self.assertEqual(agent.install_paths(home / ".local/bin/tool0", agent.home_or_ancestor),
+                         {home / ".local"})
 
     def test_issue13_claude_and_codex_install_locations(self):
         home = self.home

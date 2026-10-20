@@ -770,6 +770,45 @@ print(json.dumps({"roleCredentials": {"accessKeyId": "EVIL-KEY",
                 finally:
                     shutil.rmtree(work)
 
+    def test_pr25_link_to_home_on_aws_chain(self):
+        # PR #25 review 1, finding 1: PATH `<W>/p/aws -> ~/d/h/opt/bin/aws`
+        # with `~/d/h -> ~`. Run 1 must not repoint `~/d/h` to a HOME copy
+        # with an evil `aws`; run 2 still mints FAKE-KEY.
+        work = self.home / "pr25-home-link"
+        home = self.scratch_home(work)
+        try:
+            (home / "opt/bin").mkdir(parents=True)
+            shutil.copy2(self.home / "bin/aws", home / "opt/bin/aws")
+            evil = home / "evilhome/opt/bin/aws"
+            evil.parent.mkdir(parents=True)
+            evil.write_text(f"#!{sys.executable} -I\n" + '''import json
+print(json.dumps({"roleCredentials": {"accessKeyId": "EVIL-KEY",
+    "secretAccessKey": "EVIL", "sessionToken": "EVIL"}}))
+''')
+            evil.chmod(0o700)
+            (home / "d").mkdir()
+            (home / "d/h").symlink_to(home)
+            (work / "p").mkdir()
+            (work / "p/aws").symlink_to(home / "d/h/opt/bin/aws")
+            env = dict(self.env, HOME=str(home), PATH=f"{work}/p:{self.home}/bin:" + os.environ["PATH"])
+            result = self.run_in(home, env, ["/bin/sh", "-c", 'ln -sfn "$HOME/evilhome" "$HOME/d/h"'])
+            print(f"PR25 ln -sfn ~/evilhome ~/d/h: exit={result.returncode} [{result.stderr.strip()}]",
+                  flush=True)
+            if sys.platform == "darwin":
+                self.assertNotEqual(result.returncode, 0, "~/d/h repointed")
+                self.assertRegex(result.stderr.lower(), "not permitted")
+            self.assertEqual(os.readlink(home / "d/h"), str(home), "~/d/h repointed on the host")
+            # Positive control: the project is writable; run 2 pins the original aws.
+            result = self.run_in(home, env, ["/bin/sh", "-c", 'echo ok > "$HOME/project/x" && '
+                                             'cat "$AWS_SHARED_CREDENTIALS_FILE"'])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((home / "project/x").read_text(), "ok\n")
+            self.assertIn("FAKE-KEY", result.stdout)
+            self.assertNotIn("EVIL-KEY", result.stdout)
+            print("PR25 PASS: ~/d/h unchanged, ~/project writable, run 2 minted FAKE-KEY", flush=True)
+        finally:
+            shutil.rmtree(work)
+
     def test_issue13_run_command_install_location(self):
         # Issue #13: the run's own command is a symlink in ~/.local/bin into
         # its install location (claude: a versions/ file; codex: a `current`
