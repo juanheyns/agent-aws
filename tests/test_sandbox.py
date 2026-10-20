@@ -443,6 +443,43 @@ sys.exit(0 if rc == 0 else 1)
             for name in (".claude", ".codex", "tools"):
                 shutil.rmtree(home / name)
 
+    def test_review2_symlinked_codex_agents_md(self):
+        # Review round 2, R2-1: ~/.codex/AGENTS.md as a symlink into a
+        # dotfiles repo (relative and absolute link). The run must start, and
+        # replacing the link (rm plus a new file) must not persist on the host.
+        home = self.home
+        agents = home / ".codex/AGENTS.md"
+        self.write_fixtures({"dotfiles/AGENTS.md": "# dotfiles\n",
+                             ".codex/config.toml": 'model = "fixture"\n'})
+        try:
+            for link in ("../dotfiles/AGENTS.md", str(home / "dotfiles/AGENTS.md")):
+                with self.subTest(link=link):
+                    agents.unlink(missing_ok=True)
+                    agents.symlink_to(link)
+                    result = self.run_shell("cat ~/.codex/AGENTS.md")
+                    print(f"REVIEW2 RUN STARTS link={link} exit={result.returncode} "
+                          f"[{result.stderr.strip().splitlines()[-1:]}]", flush=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("# dotfiles", result.stdout)
+                    for command in ("rm ~/.codex/AGENTS.md && echo 'run evil' > ~/.codex/AGENTS.md",
+                                    "echo 'run evil' >> ~/.codex/AGENTS.md"):
+                        result = self.run_shell(command)
+                        print(f"REVIEW2 exit={result.returncode} {command} "
+                              f"[{result.stderr.strip().splitlines()[-1:]}]", flush=True)
+                        if sys.platform == "darwin":
+                            self.assertNotEqual(result.returncode, 0, command)
+                        self.assertTrue(agents.is_symlink(), f"{agents} replaced on host")
+                        self.assertEqual(os.readlink(agents), link)
+                        self.assertEqual((home / "dotfiles/AGENTS.md").read_text(), "# dotfiles\n")
+                    print(f"REVIEW2 HOST LINK AND TARGET UNCHANGED link={link}", flush=True)
+                    # Positive control: config.toml is still writable in place.
+                    result = self.run_shell("echo '# ok' >> ~/.codex/config.toml")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("# ok", (home / ".codex/config.toml").read_text())
+        finally:
+            for name in (".codex", "dotfiles"):
+                shutil.rmtree(home / name)
+
     def test_issue4_homebrew_prefix_dependencies(self):
         # Scratch model of a user-owned Homebrew prefix: PATH holds symlinks
         # into Cellar/, and interpreters load libraries through opt/.

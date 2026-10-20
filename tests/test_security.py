@@ -823,6 +823,22 @@ class Issue8AgentConfigTests(unittest.TestCase):
         self.assertIn(f"--tmpfs {codex} ", text)
         self.assertNotIn(f"--bind {codex} {codex} ", text)
         self.assertNotIn(home / ".codex", agent.linux_parent_binds(protected))
+        # Review round 2, R2-1: a protected child that is a symlink (stow-style
+        # dotfiles) keeps the skeleton. Inside a read-write bind its --ro-bind
+        # destination would be a host symlink: bwrap fails, or rm plus a new
+        # file persists on the host.
+        self.write("dotfiles/AGENTS.md", "# dotfiles\n")
+        agents = home / ".codex/AGENTS.md"
+        for link in ("../dotfiles/AGENTS.md", str(home / "dotfiles/AGENTS.md")):
+            with self.subTest(link=link):
+                agents.unlink()
+                agents.symlink_to(link)
+                argv, protected = self.linux_argv()
+                text = " ".join(argv) + " "
+                self.assertIn(f"--tmpfs {codex} ", text)
+                self.assertNotIn(f"--bind {codex} {codex} ", text)
+                self.assertIn(f"--ro-bind {home}/dotfiles/AGENTS.md {codex}/AGENTS.md ", text)
+                self.assertNotIn(home / ".codex", agent.linux_parent_binds(protected))
 
     def test_issue8_home_and_ancestors_never_protected(self):
         self.write("notes.txt", "not a directory\n")
