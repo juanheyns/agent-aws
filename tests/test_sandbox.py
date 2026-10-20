@@ -695,9 +695,13 @@ sys.exit(0 if rc == 0 else 1)
                                     env=env, cwd=home, capture_output=True, text=True, timeout=20)
             self.assertTrue((home / "project/x").exists(), f"HOME not writable: {result.stderr}")
             self.assertEqual((home / "project/x").read_text(), "ok\n")
-            self.assertNotEqual(result.returncode, 0, "bin dir of the aws prefix not protected")
-            self.assertFalse((work / "a/bin/x").exists())
-            print(f"ISSUE19 PASS: HOME writable, bin denied [{result.stderr.strip()}]", flush=True)
+            # macOS denies the write; on Linux /tmp is a private tmpfs, so
+            # the write must only not reach the host.
+            if sys.platform == "darwin":
+                self.assertNotEqual(result.returncode, 0, "bin dir of the aws prefix not protected")
+            self.assertFalse((work / "a/bin/x").exists(), "bin dir of the aws prefix not protected")
+            print(f"ISSUE19 PASS: HOME writable, bin write not persisted "
+                  f"[exit {result.returncode}; {result.stderr.strip()}]", flush=True)
         finally:
             shutil.rmtree(work)
 
