@@ -69,7 +69,12 @@ missing earlier entries), their resolved targets, CLI/interpreter installation
 prefixes, and their ancestors. This prevents a run from planting an `aws`
 that a later run executes with the SSO token. When the `aws` or `python3`
 prefix (the `../..` of the resolved executable) is HOME or an ancestor of
-HOME, only the executable's directory is protected, so HOME stays writable.
+HOME, only the executable's directory is protected, so HOME stays writable;
+if that directory is itself HOME or an ancestor of HOME, only the executable
+is protected. HOME is compared both as given and resolved. The agent-aws
+interpreter's own prefix (`sys.prefix`, `sys.base_prefix`) is protected
+without this HOME rule: if that prefix is HOME's parent, HOME stays
+write-denied (fail-safe).
 The developer still supplies a trusted initial PATH and installation; this
 is not a scan of pre-existing executables for malicious content.
 

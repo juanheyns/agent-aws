@@ -402,6 +402,35 @@ class ConfigTests(unittest.TestCase):
                 self.assertTrue(prefix in self.protected_for_path_exe(
                     home, name, prefix / "bin" / name), f"prefix {prefix} not protected")
 
+    def test_issue19_symlinked_home_path_uses_resolved_home(self):
+        # PR #21 review round 1, nit 2: HOME `<W>/link/home` with `<W>/link -> <W>/a`
+        # and `aws -> <W>/a/bin/aws`: the resolved prefix `<W>/a` is HOME's parent.
+        for name in ("aws", "python3"):
+            with self.subTest(name=name):
+                work = self.home / f"nit2-{name}"
+                (work / "a/home").mkdir(parents=True)
+                (work / "link").symlink_to(work / "a")
+                home = work / "link/home"
+                protected = self.protected_for_path_exe(home, name, work / "a/bin" / name)
+                self.assertFalse(work / "a" in protected, "resolved HOME parent protected")
+                self.assertFalse(work / "a/home" in protected, "resolved HOME protected")
+                self.assertTrue(work / "a/bin" in protected, "bin dir not protected (fallback)")
+
+    def test_issue19_fallback_bin_dir_home_or_ancestor_protects_only_executable(self):
+        # PR #21 review round 1, nit 4: the executable sits directly in HOME's
+        # parent (`<W>/b/aws`) or in HOME (`~/aws`); PATH itself is outside HOME.
+        for name in ("aws", "python3"):
+            for layout in ("b/aws", "c/home/aws"):
+                with self.subTest(name=name, layout=layout):
+                    work = self.home / f"nit4-{name}"
+                    home = work / layout.split("/")[0] / "home"
+                    home.mkdir(parents=True, exist_ok=True)
+                    target = work / layout.replace("aws", name)
+                    protected = self.protected_for_path_exe(home, name, target)
+                    self.assertFalse(home in protected, "HOME must stay writable")
+                    self.assertFalse(home.parent in protected, "HOME parent protected")
+                    self.assertTrue(target in protected, f"{target} not protected")
+
     def test_round4_script_python_trampoline_env_options_and_pypy(self):
         # Review round 1, finding 6.
         bindir = self.home / "pathbin"
