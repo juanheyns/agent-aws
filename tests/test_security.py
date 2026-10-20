@@ -22,12 +22,15 @@ loader.exec_module(agent)
 # Issue #6 resolvers, kept before setUpModule replaces them.
 git_config_paths = getattr(agent, "git_config_paths", None)
 ssh_config_paths = getattr(agent, "ssh_config_paths", None)
+# Issue #8 resolver.
+agent_config_paths = getattr(agent, "agent_config_paths", None)
+HAS_TOMLLIB = importlib.util.find_spec("tomllib") is not None
 
 
 def setUpModule():
     # Tests that call protected_paths() with the real HOME must not read the
-    # developer's real git or ssh configuration.
-    for name in ("git_config_paths", "ssh_config_paths"):
+    # developer's real git, ssh or agent configuration.
+    for name in ("git_config_paths", "ssh_config_paths", "agent_config_paths"):
         patcher = mock.patch.object(agent, name, return_value=set(), create=True)
         patcher.start()
         unittest.addModuleCleanup(patcher.stop)
@@ -662,7 +665,7 @@ class Issue6ResolverTests(unittest.TestCase):
         self.assertIn(f"--bind {home}/Source/github.com/other {home}/Source/github.com/other", argv)
         note = error.getvalue()
         self.assertIn("agent-aws: Linux: new top-level entries in these directories are lost "
-                      "when the run ends (they hold protected git/ssh targets): ", note)
+                      "when the run ends (they hold protected git/ssh/agent config targets): ", note)
         self.assertIn("~/Source, ~/Source/github.com, ~/Source/github.com/me, "
                       "~/Source/github.com/me/dotfiles, ~/work\n", note)
         # Skeletons that STARTUP_PATHS make anyway, and read-only
@@ -671,6 +674,182 @@ class Issue6ResolverTests(unittest.TestCase):
             self.assertNotIn(f"{name},", note)
             self.assertNotIn(f"{name}\n", note)
         self.assertEqual(quiet.getvalue(), "")
+
+
+
+class Issue8AgentConfigTests(unittest.TestCase):
+    """Programs that user-level agent config names (issue #8), scratch HOME only."""
+
+    def setUp(self):
+        self.assertIsNotNone(agent_config_paths, "agent_config_paths() is missing")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name).resolve()
+        patcher = mock.patch.object(agent, "HOME", self.home)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    write = Issue6ResolverTests.write
+    assert_protected = Issue6ResolverTests.assert_protected
+
+    def resolve(self):
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            paths = agent_config_paths()
+        return paths, error.getvalue()
+
+    def test_issue8_instructions_protected_and_config_files_writable(self):
+        paths = {agent.HOME / path for path in agent.STARTUP_PATHS}
+        self.assert_protected(paths, ".claude/CLAUDE.md", ".claude/agents", ".claude/commands",
+                              ".claude/skills", ".codex/AGENTS.md", ".codex/AGENTS.override.md")
+        for name in (".claude.json", ".claude", ".claude/plugins", ".claude/projects", ".codex",
+                     ".codex/config.toml", ".codex/auth.json", ".codex/sessions"):
+            self.assertNotIn(self.home / name, paths, name)
+
+    def test_issue8_claude_hooks_helpers_and_mcp_servers(self):
+        marker = self.home / "ran"
+        self.write(".claude/settings.json", json.dumps({
+            "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "~/.claude/hooks/pre.sh --flag"},
+                {"type": "command", "command": f"touch {marker}"},  # bare: PATH
+                {"type": "command", "command": "./relative-hook"},
+                {"type": "command", "command": '"$CLAUDE_PROJECT_DIR"/.claude/hooks/p.sh'},
+                {"type": "prompt", "prompt": "no command"}]}],
+                "Stop": [{"hooks": [{"type": "command", "command": '"$HOME/hooks dir/stop.sh"'}]}]},
+            "statusLine": {"type": "command", "command": "${HOME}/bin-x/status"},
+            "apiKeyHelper": "/opt/helpers/key-helper",
+        }))
+        self.write(".claude/settings.local.json", json.dumps({"hooks": {"PostToolUse": [
+            {"hooks": [{"type": "command", "command": f"exec {self.home}/local-hook"}]}]}}))
+        self.write(".claude.json", json.dumps({
+            "mcpServers": {"a": {"command": "~/My Tools/server", "args": ["--x"]},
+                           "b": {"command": "npx", "args": ["-y", "pkg"]},
+                           "c": {"type": "http", "url": "https://example.invalid/mcp"}},
+            "projects": {"/some/project": {"mcpServers": {"p": {"command": f"{self.home}/proj-mcp"}}},
+                         "/other": {"mcpServers": []}},
+        }))
+        paths, error = self.resolve()
+        self.assertEqual(error, "")
+        self.assert_protected(paths, ".claude/hooks/pre.sh", "hooks dir/stop.sh", "bin-x/status",
+                              "/opt/helpers/key-helper", "local-hook", "My Tools/server", "proj-mcp")
+        for absent in ("touch", "npx", "relative-hook", ".claude/hooks/p.sh", ".claude.json",
+                       ".claude/settings.json", ".claude/settings.local.json"):
+            self.assertNotIn(self.home / absent, paths)
+        self.assertFalse(any(path.name in ("touch", "npx") for path in paths), paths)
+        self.assertFalse(marker.exists(), "a configured command was executed")
+
+    @unittest.skipUnless(HAS_TOMLLIB, "tomllib requires Python 3.11+")
+    def test_issue8_codex_mcp_servers_and_notify(self):
+        self.write(".codex/config.toml", "\n".join([
+            'model = "fixture"',
+            'notify = ["~/tools/notify", "--flag"]',
+            "[mcp_servers.a]", 'command = "/opt/mcp/a"',
+            "[mcp_servers.b]", 'command = "uvx"',
+            "[mcp_servers.c]", 'url = "https://example.invalid/mcp"', ""]))
+        paths, error = self.resolve()
+        self.assertEqual(error, "")
+        self.assert_protected(paths, "tools/notify", "/opt/mcp/a")
+        self.assertNotIn(self.home / "uvx", paths)
+        self.assertNotIn(self.home / ".codex/config.toml", paths)
+        self.write(".codex/config.toml", 'notify = ["notify-send"]\n')
+        self.assertEqual(self.resolve(), (set(), ""))
+
+    def test_issue8_bad_config_warns_and_continues(self):
+        self.write(".claude/settings.json", "{not json")
+        self.write(".claude/settings.local.json", json.dumps({"hooks": {"Stop": [
+            {"hooks": [{"type": "command", "command": "~/ok-hook"}]}]}}))
+        self.write(".claude.json", "[1, 2]")  # valid JSON, unexpected shape
+        self.write(".codex/config.toml", "notify = [unterminated\n")
+        paths, error = self.resolve()
+        self.assertIn("cannot parse", error)
+        self.assertIn("settings.json", error)
+        if HAS_TOMLLIB:
+            self.assertIn("config.toml", error)
+        self.assert_protected(paths, "ok-hook")
+        # Wrong types anywhere are skipped without an error.
+        codex = self.home / ".codex/config.toml"
+        codex.write_text('notify = "not a list"\n') if HAS_TOMLLIB else codex.unlink()
+        self.write(".claude/settings.json", json.dumps({"hooks": {"Stop": "x", "Pre": [1, {"hooks": "y"}]},
+                                                        "statusLine": "z", "apiKeyHelper": 3}))
+        self.write(".claude.json", json.dumps({"mcpServers": {"a": 1, "b": {"command": 2}},
+                                               "projects": [1]}))
+        paths, error = self.resolve()
+        self.assertEqual(error, "")
+        self.assertEqual(paths, {self.home / "ok-hook"})
+        with mock.patch.object(agent, "tomllib", None, create=True):
+            self.write(".codex/config.toml", 'notify = ["~/tools/notify"]\n')
+            paths, error = self.resolve()
+        self.assertIn("tomllib", error)
+        self.assertEqual(paths, {self.home / "ok-hook"})
+
+    def test_issue8_quoted_home_hook_commands(self):
+        # Review round 1, finding 2: a quoted "$HOME" followed by the path.
+        forms = ('"$HOME"/.claude/hooks/a.sh', '"$HOME/.claude/hooks/b.sh"',
+                 "$HOME/.claude/hooks/c.sh --x", "${HOME}/.claude/hooks/f.sh",
+                 '"${HOME}"/.claude/hooks/g.sh arg')
+        self.write(".claude/settings.json", json.dumps({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": command} for command in forms]}]}}))
+        paths, error = self.resolve()
+        self.assertEqual(error, "")
+        self.assertEqual(paths, {self.home / f".claude/hooks/{name}.sh" for name in "abcfg"})
+
+    def linux_argv(self, targets=frozenset()):
+        with mock.patch.multiple(agent, AWS_DIR=self.home / ".aws",
+                                 AGENT_DIR=self.home / ".agent-aws"):
+            protected = agent.protected_paths(set(targets))
+            return agent.linux_home_mounts(protected), protected
+
+    def test_issue8_linux_codex_parent_bind(self):
+        # Review round 1, finding 4: ~/.codex is bound read-write on Linux
+        # (config.toml can be replaced by rename); only the existing
+        # instruction files below it are read-only mounts.
+        self.write(".codex/AGENTS.md", "# fixture\n")
+        self.write(".codex/config.toml", 'model = "fixture"\n')
+        home = self.home
+        argv, _ = self.linux_argv()
+        text = " ".join(argv) + " "
+        codex = f"{home}/.codex"
+        self.assertIn(f"--bind {codex} {codex} ", text)
+        self.assertIn(f"--ro-bind {codex}/AGENTS.md {codex}/AGENTS.md ", text)
+        self.assertNotIn(f"--tmpfs {codex} ", text)
+        self.assertNotIn("AGENTS.override.md", text)
+        self.assertNotIn(f"{codex}/config.toml", text)
+        # The parent bind comes before the read-only child.
+        self.assertLess(text.index(f"--bind {codex} "), text.index(f"--ro-bind {codex}/AGENTS.md"))
+        # A config target below ~/.codex keeps the skeleton: a missing
+        # program there must not be creatable.
+        argv, protected = self.linux_argv({home / ".codex/hooks/notify.sh"})
+        text = " ".join(argv) + " "
+        self.assertIn(f"--tmpfs {codex} ", text)
+        self.assertNotIn(f"--bind {codex} {codex} ", text)
+        self.assertNotIn(home / ".codex", agent.linux_parent_binds(protected))
+        # Review round 2, R2-1: a protected child that is a symlink (stow-style
+        # dotfiles) keeps the skeleton. Inside a read-write bind its --ro-bind
+        # destination would be a host symlink: bwrap fails, or rm plus a new
+        # file persists on the host.
+        self.write("dotfiles/AGENTS.md", "# dotfiles\n")
+        agents = home / ".codex/AGENTS.md"
+        for link in ("../dotfiles/AGENTS.md", str(home / "dotfiles/AGENTS.md")):
+            with self.subTest(link=link):
+                agents.unlink()
+                agents.symlink_to(link)
+                argv, protected = self.linux_argv()
+                text = " ".join(argv) + " "
+                self.assertIn(f"--tmpfs {codex} ", text)
+                self.assertNotIn(f"--bind {codex} {codex} ", text)
+                self.assertIn(f"--ro-bind {home}/dotfiles/AGENTS.md {codex}/AGENTS.md ", text)
+                self.assertNotIn(home / ".codex", agent.linux_parent_binds(protected))
+
+    def test_issue8_home_and_ancestors_never_protected(self):
+        self.write("notes.txt", "not a directory\n")
+        self.write(".claude/settings.json", json.dumps({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": command}
+            for command in ("~", "/", str(self.home.parent), "~/notes.txt/sub")]}]}}))
+        self.write(".claude.json", json.dumps({"mcpServers": {"a": {"command": "~"}}}))
+        paths, _ = self.resolve()
+        self.assertNotIn(self.home, paths)
+        self.assertFalse(paths & set(self.home.parents), paths & set(self.home.parents))
+        self.assertNotIn(self.home / "notes.txt/sub", paths)
 
 
 if __name__ == "__main__":

@@ -30,6 +30,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    tomllib = None
+
 __version__ = "1.0.0"
 
 HOME = Path.home()
@@ -55,7 +60,20 @@ STARTUP_PATHS = (
     ".gitconfig", ".config/git",
     ".ssh/config", ".ssh/rc", ".ssh/authorized_keys", ".ssh/authorized_keys2",
     ".claude/settings.json", ".claude/settings.local.json",
+    # User-level agent instructions that later sessions load (#8). The agents'
+    # own config and state (~/.claude.json, ~/.claude/projects, plugins,
+    # ~/.codex/config.toml, auth.json, sessions) stay writable.
+    ".claude/CLAUDE.md", ".claude/agents", ".claude/commands", ".claude/skills",
+    ".codex/AGENTS.md", ".codex/AGENTS.override.md",
 )
+# Linux: HOME-relative directories that are bound read-write instead of made
+# a private skeleton, with their existing protected children bound read-only
+# on top. Use it for a directory whose own files the agents replace by rename
+# (~/.codex/config.toml). The directory and each existing protected child are
+# mount points, so neither can be renamed or unlinked. Cost: a missing
+# protected child can be created on the host. Not used (skeleton instead)
+# when a protected child is a symlink. See linux_parent_binds().
+LINUX_PARENT_BIND = (".codex",)
 # Asked of the interpreter named by a Python `aws` script. -I -S: no site,
 # user-site or working-directory code runs while answering.
 PYTHON_PATHS_PROBE = (
@@ -101,6 +119,9 @@ GIT_COMMAND_KEYS = {
 }
 SSH_COMMAND_KEYWORDS = ("proxycommand", "localcommand", "knownhostscommand")
 SSH_LIBRARY_KEYWORDS = ("pkcs11provider", "securitykeyprovider")
+# Claude Code settings whose value is a shell command (besides hooks and
+# statusLine.command).
+CLAUDE_COMMAND_KEYS = ("apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper")
 
 IS_MACOS = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
@@ -761,9 +782,79 @@ def ssh_config_paths():
     return usable_targets(paths)
 
 
+def load_agent_config(path, parse):
+    """Parsed config file, or None if it is missing or cannot be parsed (warns)."""
+    try:
+        if not path.is_file():
+            return None
+        return parse(path.read_bytes())
+    except (OSError, ValueError, RecursionError) as exc:
+        warn(f"cannot parse {path} ({exc}); the programs it names are not protected")
+        return None
+
+
+def mcp_server_programs(servers):
+    if not isinstance(servers, dict):
+        return []
+    return [server.get("command") for server in servers.values() if isinstance(server, dict)]
+
+
+def agent_config_paths():
+    """Programs that user-level Claude Code and Codex config names (issue #8).
+
+    Read: hook commands, statusLine.command and helper commands in
+    ~/.claude/settings.json and settings.local.json; mcpServers.*.command in
+    ~/.claude.json (top level and projects.*); mcp_servers.*.command and
+    notify[0] in ~/.codex/config.toml. Only an absolute or ~ program is kept
+    (for a shell command, its first word, with a leading $HOME as ~). Nothing
+    is executed. The config files stay writable: the agents write them.
+    """
+    commands, programs = [], []
+    for name in ("settings.json", "settings.local.json"):
+        settings = load_agent_config(HOME / ".claude" / name, json.loads)
+        if not isinstance(settings, dict):
+            continue
+        hooks = settings.get("hooks")
+        for groups in hooks.values() if isinstance(hooks, dict) else ():
+            for group in groups if isinstance(groups, list) else ():
+                entries = group.get("hooks") if isinstance(group, dict) else None
+                commands += [hook.get("command") for hook in entries or ()
+                             if isinstance(entries, list) and isinstance(hook, dict)]
+        status = settings.get("statusLine")
+        if isinstance(status, dict):
+            commands.append(status.get("command"))
+        commands += [settings.get(key) for key in CLAUDE_COMMAND_KEYS]
+    state = load_agent_config(HOME / ".claude.json", json.loads)
+    if isinstance(state, dict):
+        programs += mcp_server_programs(state.get("mcpServers"))
+        projects = state.get("projects")
+        for project in projects.values() if isinstance(projects, dict) else ():
+            if isinstance(project, dict):
+                programs += mcp_server_programs(project.get("mcpServers"))
+    codex = HOME / ".codex/config.toml"
+    if tomllib is None:
+        if codex.is_file():
+            warn(f"tomllib needs Python 3.11+; the programs that {codex} names are not protected")
+    else:
+        config = load_agent_config(codex, lambda data: tomllib.loads(data.decode()))
+        if isinstance(config, dict):
+            programs += mcp_server_programs(config.get("mcp_servers"))
+            notify = config.get("notify")
+            if isinstance(notify, list) and notify:
+                programs.append(notify[0])
+    # A shell command expands $HOME (also "$HOME"/x); an MCP or notify
+    # program is one argv word.
+    paths = {command_program(re.sub(r"^([\"']?)\$(HOME|\{HOME\})/", r"\1~/",
+                                    re.sub(r'^"\$(HOME|\{HOME\})"/', "~/", command)))
+             for command in commands if isinstance(command, str)}
+    paths.update(command_program(shlex.quote(program))
+                 for program in programs if isinstance(program, str) and program)
+    return usable_targets(paths - {None})
+
+
 def config_targets():
-    """Files and programs that the protected git and ssh config refer to (#6)."""
-    return git_config_paths() | ssh_config_paths()
+    """Files and programs that the protected git, ssh (#6) and agent (#8) config refer to."""
+    return git_config_paths() | ssh_config_paths() | agent_config_paths()
 
 
 def protected_paths(targets=None):
@@ -833,11 +924,36 @@ def build_sandbox_argv_darwin(creds_dir, paths=None):
     ]
 
 
+def linux_parent_binds(protected):
+    """LINUX_PARENT_BIND directories that linux_home_mounts() binds read-write.
+
+    Only a real directory (not a symlink) whose protected paths below it are
+    all STARTUP_PATHS direct children, none of them a symlink (existing or
+    dangling). Any other protected path below it (a config target) keeps the
+    skeleton, so a missing program there cannot be created. A symlinked child
+    (e.g. into a dotfiles repo) also keeps the skeleton: in a read-write bind
+    its --ro-bind destination would be a host symlink, so bwrap would fail or
+    rm plus a new file would persist on the host.
+    """
+    startup = {HOME / path for path in STARTUP_PATHS}
+    binds = set()
+    for name in LINUX_PARENT_BIND:
+        directory = HOME / name
+        if directory in protected or directory.is_symlink() or not directory.is_dir():
+            continue
+        below = [path for path in protected if directory in path.parents]
+        if all(path in startup and path.parent == directory
+               and not path.is_symlink() for path in below):
+            binds.add(directory)
+    return binds
+
+
 def linux_home_mounts(protected=None):
     # Private skeletons prevent missing protected paths from being planted on
     # the host. Existing unprotected children (e.g. projects) remain writable.
     argv = []
     protected = protected_paths() if protected is None else protected
+    parent_binds = linux_parent_binds(protected)
     private = {AWS_DIR, AGENT_DIR}
     containers = {HOME}
     containers.update(parent for path in protected for parent in path.parents
@@ -852,6 +968,13 @@ def linux_home_mounts(protected=None):
                 continue
             if child in protected:
                 argv.extend(["--ro-bind", str(child.resolve()), str(child)])
+            elif child in parent_binds:
+                # Mount points: the directory and its existing protected
+                # children cannot be renamed or unlinked from the run.
+                argv.extend(["--bind", str(child), str(child)])
+                for path in sorted(path for path in protected
+                                   if path.parent == child and path.exists()):
+                    argv.extend(["--ro-bind", str(path.resolve()), str(path)])
             elif child in containers:
                 mirror(child)
             elif child.is_symlink():
@@ -876,7 +999,7 @@ def linux_home_mounts(protected=None):
 
 def linux_target_skeletons(protected, targets):
     """Directories that linux_home_mounts() makes private skeletons only
-    because a git/ssh config target (#6) is below them.
+    because a git/ssh (#6) or agent (#8) config target is below them.
 
     Every directory between HOME and a target is a skeleton (also when the
     target is missing): new top-level entries in it are lost when the run
@@ -887,7 +1010,9 @@ def linux_target_skeletons(protected, targets):
     def containers(paths):
         return {parent for path in paths for parent in path.parents if HOME in parent.parents}
 
-    skeletons = containers(targets) - containers(set(protected) - targets)
+    others = set(protected) - targets
+    skeletons = (containers(targets) - (containers(others) - linux_parent_binds(others))
+                 - linux_parent_binds(protected))
     # A directory below a protected path is read-only, not a skeleton.
     return sorted(path for path in skeletons
                   if not any(part in protected for part in (path, *path.parents)))
@@ -898,7 +1023,8 @@ def linux_skeleton_note(protected, targets):
     if skeletons:
         names = ", ".join(f"~/{path.relative_to(HOME)}" for path in skeletons)
         print("agent-aws: Linux: new top-level entries in these directories are lost when "
-              f"the run ends (they hold protected git/ssh targets): {names}", file=sys.stderr)
+              f"the run ends (they hold protected git/ssh/agent config targets): {names}",
+              file=sys.stderr)
 
 
 def build_sandbox_argv_linux(creds_dir, protected=None):

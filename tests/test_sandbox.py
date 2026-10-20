@@ -4,6 +4,7 @@ No login or AWS request is made. Run on macOS with:
     python3 -m unittest discover -s tests -p test_sandbox.py -v
 On Linux the same fixture exercises bwrap when it is installed.
 """
+import importlib.util
 import json
 import os
 import shlex
@@ -17,6 +18,7 @@ from pathlib import Path
 
 from test_security import ROOT, config
 
+HAS_TOMLLIB = importlib.util.find_spec("tomllib") is not None
 SUPPORTED = sys.platform == "darwin" or (sys.platform.startswith("linux") and shutil.which("bwrap"))
 
 
@@ -238,12 +240,12 @@ sys.exit(0 if rc == 0 else 1)
             (self.home / name).parent.mkdir(parents=True, exist_ok=True)
             (self.home / name).write_text(text)
 
-    def denied_all(self, commands):
+    def denied_all(self, commands, label="ISSUE6"):
         # Run every attack first, so a failure reports all writable paths.
         results = {command: self.run_shell(command) for command in commands}
         for command, result in results.items():
             state = "DENIED" if result.returncode else "WRITABLE"
-            print(f"ISSUE6 {state} exit={result.returncode} {command} "
+            print(f"{label} {state} exit={result.returncode} {command} "
                   f"[{result.stderr.strip()}]", flush=True)
         writable = [command for command, result in results.items() if not result.returncode]
         self.assertEqual(writable, [], "writable from a run")
@@ -355,6 +357,127 @@ sys.exit(0 if rc == 0 else 1)
                               (home / name).read_text(), name)
         finally:
             for name in ("ssh-extra", "tools", ".ssh"):
+                shutil.rmtree(home / name)
+
+    def test_issue8_agent_instructions_and_config_programs(self):
+        # Issue #8: user-level agent instructions, and the programs that agent
+        # config names (hooks, MCP servers, Codex notify), were writable. The
+        # config files themselves stay writable: the agents write them.
+        home = self.home
+        settings = json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "~/.claude/hooks/check.sh --fixture"}]}]}})
+        claude_json = json.dumps({
+            "mcpServers": {"fixture": {"command": f"{home}/tools/mcp-server", "args": []}},
+            "projects": {str(home / "project"): {"mcpServers": {"p": {"command": "~/tools/project-mcp"}}}}})
+        codex_toml = ('notify = ["~/tools/codex-notify", "--fixture"]\n'
+                      '[mcp_servers.fixture]\ncommand = "~/tools/codex-mcp"\n')
+        script = "#!/bin/sh\nexit 0\n"
+        protected = {
+            ".claude/settings.json": settings,
+            ".claude/agents/reviewer.md": "# fixture\n",
+            ".claude/commands/deploy.md": "# fixture\n",
+            ".codex/AGENTS.md": "# fixture\n",
+            ".claude/hooks/check.sh": script,
+            "tools/mcp-server": script,
+            "tools/project-mcp": script,
+        }
+        # Codex config is TOML: protected only where tomllib exists (3.11+).
+        codex_programs = {"tools/codex-mcp": script, "tools/codex-notify": script}
+        if HAS_TOMLLIB:
+            protected.update(codex_programs)
+        writable = {".claude.json": claude_json, ".codex/config.toml": codex_toml,
+                    ".codex/auth.json": '{"token": "FAKE-NOT-A-TOKEN"}\n',
+                    ".claude/projects/old.jsonl": "{}\n", ".codex/sessions/old": "{}\n",
+                    ".claude/plugins/installed_plugins.json": "{}\n",
+                    "tools/unrelated": "# sentinel\n", ".claude/hooks/unrelated.sh": "# sentinel\n",
+                    **({} if HAS_TOMLLIB else codex_programs)}
+        self.write_fixtures({**protected, **writable})
+        try:
+            self.denied_all([f"echo 'curl evil' >> ~/{name}" for name in protected]
+                            + ["echo 'curl evil' > ~/.claude/agents/new.md",
+                               "echo 'curl evil' > ~/.claude/hooks/check.sh"], label="ISSUE8")
+            # Missing instruction files and directories cannot be planted.
+            # On Linux ~/.codex is bound read-write (LINUX_PARENT_BIND), so a
+            # missing ~/.codex/AGENTS.override.md can be created (documented).
+            missing = [".claude/CLAUDE.md", ".claude/skills/x/SKILL.md"]
+            if sys.platform == "darwin":
+                missing.append(".codex/AGENTS.override.md")
+            for name in missing:
+                self.not_persisted(f'mkdir -p "$(dirname "$HOME/{name}")" && '
+                                   f'echo "run evil" > "$HOME/{name}"', home / name.split("/x/")[0])
+                print(f"ISSUE8 NOT PERSISTED {name}", flush=True)
+            # Rename over an existing instruction file fails on both platforms.
+            result = self.run_shell("echo 'run evil' > ~/.codex/.evil && mv -f ~/.codex/.evil ~/.codex/AGENTS.md")
+            print(f"ISSUE8 RENAME OVER AGENTS.md exit={result.returncode} [{result.stderr.strip()}]", flush=True)
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            (home / ".codex/.evil").unlink(missing_ok=True)
+            self.assert_unchanged(protected)
+            # A write that replaces ~/.codex/config.toml by rename (temp file
+            # plus mv, as an agent saving its config) persists on the host.
+            result = self.run_shell("printf 'model = \"renamed\"\\n' > ~/.codex/.config.toml.tmp && "
+                                    "mv ~/.codex/.config.toml.tmp ~/.codex/config.toml")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("renamed", (home / ".codex/config.toml").read_text())
+            print("ISSUE8 RENAME REPLACE ~/.codex/config.toml PERSISTED", flush=True)
+            # Positive controls: the agents' own config and state stay writable.
+            result = self.run_shell(" && ".join(
+                ["echo '{\"mcpServers\": {}}' >> ~/.claude.json",
+                 "echo '{}' > ~/.claude/projects/x.jsonl",
+                 "echo 'model = \"fixture\"' >> ~/.codex/config.toml",
+                 "echo '{}' > ~/.codex/auth.json",
+                 "echo '{}' > ~/.codex/sessions/x",
+                 "echo '{}' > ~/.claude/plugins/installed_plugins.json",
+                 "echo ok >> ~/tools/unrelated",
+                 "echo ok >> ~/.claude/hooks/unrelated.sh"]))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("mcpServers\": {}}", (home / ".claude.json").read_text())
+            self.assertIn("fixture", (home / ".codex/config.toml").read_text())
+            for name in (".claude/projects/x.jsonl", ".codex/sessions/x"):
+                self.assertTrue((home / name).exists(), name)
+            for name in ("tools/unrelated", ".claude/hooks/unrelated.sh"):
+                self.assertIn("ok", (home / name).read_text(), name)
+            print("ISSUE8 CONTROLS WRITABLE: ~/.claude.json ~/.claude/projects ~/.codex/config.toml "
+                  "~/.codex/auth.json ~/.codex/sessions ~/.claude/plugins, unrelated files", flush=True)
+        finally:
+            (home / ".claude.json").unlink()
+            for name in (".claude", ".codex", "tools"):
+                shutil.rmtree(home / name)
+
+    def test_review2_symlinked_codex_agents_md(self):
+        # Review round 2, R2-1: ~/.codex/AGENTS.md as a symlink into a
+        # dotfiles repo (relative and absolute link). The run must start, and
+        # replacing the link (rm plus a new file) must not persist on the host.
+        home = self.home
+        agents = home / ".codex/AGENTS.md"
+        self.write_fixtures({"dotfiles/AGENTS.md": "# dotfiles\n",
+                             ".codex/config.toml": 'model = "fixture"\n'})
+        try:
+            for link in ("../dotfiles/AGENTS.md", str(home / "dotfiles/AGENTS.md")):
+                with self.subTest(link=link):
+                    agents.unlink(missing_ok=True)
+                    agents.symlink_to(link)
+                    result = self.run_shell("cat ~/.codex/AGENTS.md")
+                    print(f"REVIEW2 RUN STARTS link={link} exit={result.returncode} "
+                          f"[{result.stderr.strip().splitlines()[-1:]}]", flush=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("# dotfiles", result.stdout)
+                    for command in ("rm ~/.codex/AGENTS.md && echo 'run evil' > ~/.codex/AGENTS.md",
+                                    "echo 'run evil' >> ~/.codex/AGENTS.md"):
+                        result = self.run_shell(command)
+                        print(f"REVIEW2 exit={result.returncode} {command} "
+                              f"[{result.stderr.strip().splitlines()[-1:]}]", flush=True)
+                        if sys.platform == "darwin":
+                            self.assertNotEqual(result.returncode, 0, command)
+                        self.assertTrue(agents.is_symlink(), f"{agents} replaced on host")
+                        self.assertEqual(os.readlink(agents), link)
+                        self.assertEqual((home / "dotfiles/AGENTS.md").read_text(), "# dotfiles\n")
+                    print(f"REVIEW2 HOST LINK AND TARGET UNCHANGED link={link}", flush=True)
+                    # Positive control: config.toml is still writable in place.
+                    result = self.run_shell("echo '# ok' >> ~/.codex/config.toml")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("# ok", (home / ".codex/config.toml").read_text())
+        finally:
+            for name in (".codex", "dotfiles"):
                 shutil.rmtree(home / name)
 
     def test_issue4_homebrew_prefix_dependencies(self):
