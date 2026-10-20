@@ -372,6 +372,36 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(self.home in protected, "HOME must stay writable")
         self.assertTrue(self.home / "pyvenv.cfg" in protected, "HOME/pyvenv.cfg not protected")
 
+    def protected_for_path_exe(self, home, name, target):
+        # PATH holds `name -> target`; target is a non-Python stub.
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("#!/bin/sh\n")
+        target.chmod(0o700)
+        path_dir = self.home / f"path-{name}-{len(list(self.home.iterdir()))}"
+        path_dir.mkdir()
+        (path_dir / name).symlink_to(target)
+        with mock.patch.dict(os.environ, {"PATH": str(path_dir)}), \
+             mock.patch.multiple(agent, HOME=home, python_paths=mock.Mock(return_value=[])):
+            return agent.protected_paths()
+
+    def test_issue19_prefix_guard_keeps_home_and_ancestors_writable(self):
+        # Issue #19: an `aws`/`python3` whose prefix is HOME's parent must not
+        # protect that ancestor (and so all of HOME); its bin dir is protected.
+        for name in ("aws", "python3"):
+            with self.subTest(name=name):
+                home = self.home / name / "a/home"
+                home.mkdir(parents=True)
+                bin_dir = home.parent / "bin"
+                protected = self.protected_for_path_exe(home, name, bin_dir / name)
+                self.assertFalse(home in protected, "HOME must stay writable")
+                leaked = sorted(p for p in protected if p in home.parents and self.home in p.parents)
+                self.assertEqual(leaked, [], f"HOME ancestors protected via the {name} prefix")
+                self.assertTrue(bin_dir in protected, f"{bin_dir} not protected (fallback)")
+                # Control: a prefix outside HOME's ancestors is still protected.
+                prefix = self.home / name / "opt/cli"
+                self.assertTrue(prefix in self.protected_for_path_exe(
+                    home, name, prefix / "bin" / name), f"prefix {prefix} not protected")
+
     def test_round4_script_python_trampoline_env_options_and_pypy(self):
         # Review round 1, finding 6.
         bindir = self.home / "pathbin"

@@ -900,8 +900,10 @@ def protected_paths(targets=None):
             # CLI/Python entry points can load sibling modules or libraries.
             # Protect their installation prefix, not just the executable inode.
             if name in ("aws", "python3"):
+                # Never HOME or an ancestor of it: protect the bin dir instead.
                 prefix = path.resolve().parent.parent
-                paths.add(prefix if prefix != HOME else path.resolve().parent)
+                usable = prefix != HOME and prefix not in HOME.parents
+                paths.add(prefix if usable else path.resolve().parent)
     paths.update((Path(sys.prefix), Path(sys.base_prefix)))
     paths.update(config_targets() if targets is None else targets)
     aws = shutil.which("aws", path=executable_path())

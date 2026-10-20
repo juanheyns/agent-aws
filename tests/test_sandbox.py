@@ -674,6 +674,33 @@ sys.exit(0 if rc == 0 else 1)
             self.env["PATH"] = old_path
             shutil.rmtree(prefix)
 
+    def test_issue19_aws_prefix_is_home_parent(self):
+        # Issue #19: `aws` resolves to <W>/a/bin/aws and HOME is <W>/a/home.
+        # The prefix <W>/a is an ancestor of HOME and must not be protected;
+        # HOME stays writable and the bin dir is protected instead.
+        work = self.home / "issue19"
+        home = work / "a/home"
+        for relative in (".agent-aws/config.json", ".aws/sso/cache/fake.json"):
+            (home / relative).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self.home / relative, home / relative)
+        (home / "project").mkdir()
+        (work / "a/bin").mkdir()
+        shutil.copy2(self.home / "bin/aws", work / "a/bin/aws")
+        (work / "path").mkdir()
+        (work / "path/aws").symlink_to(work / "a/bin/aws")
+        env = dict(self.env, HOME=str(home), PATH=f"{work}/path:" + os.environ["PATH"])
+        try:
+            result = subprocess.run(self.base + [f'echo ok > "{home}/project/x" && '
+                                                 f'echo bad > "{work}/a/bin/x"'],
+                                    env=env, cwd=home, capture_output=True, text=True, timeout=20)
+            self.assertTrue((home / "project/x").exists(), f"HOME not writable: {result.stderr}")
+            self.assertEqual((home / "project/x").read_text(), "ok\n")
+            self.assertNotEqual(result.returncode, 0, "bin dir of the aws prefix not protected")
+            self.assertFalse((work / "a/bin/x").exists())
+            print(f"ISSUE19 PASS: HOME writable, bin denied [{result.stderr.strip()}]", flush=True)
+        finally:
+            shutil.rmtree(work)
+
     def test_issue4_aws_script_using_other_python(self):
         # Round-3 note: `aws` may be a non-isolated script for another Python
         # (e.g. `pip install --user awscli`) whose user site we do not use.
