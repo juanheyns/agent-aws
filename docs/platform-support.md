@@ -60,8 +60,8 @@ inside a run**. On a fresh account, the first `ssh` (which creates
 or the first `codex` fails in the sandbox. Run `ssh`, `claude` and `codex`
 once outside the sandbox first. After that,
 `known_hosts` and `~/.claude/projects` stay writable. The same applies to
-`~/.config/fish`, `~/.oh-my-zsh`, `~/.config/tmux`, `~/.config/nvim` and
-`~/.ipython/profile_default`: install oh-my-zsh and start fish and IPython
+`~/.config/fish`, `~/.oh-my-zsh`, `~/.vim`, `~/.config/vim`, `~/.config/tmux`,
+`~/.config/nvim` and `~/.ipython/profile_default`: install oh-my-zsh and start fish and IPython
 once outside the sandbox.
 
 `sandbox-exec` is technically deprecated by Apple but has shown no signs of
@@ -113,12 +113,15 @@ it is bound read-write and only its existing `AGENTS.md` and
 run on Linux (macOS denies it). If one of these instruction files is a
 symlink (for example into a dotfiles repo), `~/.codex` stays a skeleton: new
 top-level entries in it are lost when the run ends, and a rename-replace of
-`config.toml` fails. `~/.config/fish` and
-`~/.oh-my-zsh` are skeletons too: an existing `fish_variables` stays writable
-in place, but fish replaces it by rename, which fails over the bind mount, so
-`set -U` changes in a run are not saved. An existing top-level entry in a skeleton directory is a
+`config.toml` fails. `~/.config/fish` and `~/.oh-my-zsh` are bound
+the same way: `fish_variables` and the oh-my-zsh checkout are plain files in a
+read-write bind, so `set -U` and `omz update` can replace them by rename. Only
+the existing `config.fish`, `conf.d`, `functions`, `completions` and
+`~/.oh-my-zsh/custom` are bound read-only; a missing one can be created in a run
+on Linux (macOS denies it). An existing top-level entry in a skeleton directory is a
 bind mount: it cannot be replaced by rename or unlinked. At run start,
-agent-aws prints the skeleton directories that come from git, SSH and agent config targets.
+agent-aws prints the skeleton directories that come from git, SSH and agent config
+targets and from the `$PYTHONSTARTUP` file.
 The reason is in the
 [threat model](threat-model.md#what-normal-use-now-breaks-inside-a-run).
 Symlink targets of protected startup files are also read-only, including targets reached through symlinked ancestors. Launch

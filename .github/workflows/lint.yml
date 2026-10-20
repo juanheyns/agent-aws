@@ -58,7 +58,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap
+          # fish: the issue9 test runs a real `set -U` in a run.
+          sudo apt-get install -y bubblewrap fish
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Unit and sandbox acceptance tests (fake AWS, scratch HOME)
         run: python -m unittest discover -s tests -v

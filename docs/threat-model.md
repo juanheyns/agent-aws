@@ -219,7 +219,7 @@ list of known paths. It does not block it in general.
   `conf.d`, `functions` and `completions`; `~/.oh-my-zsh/custom`,
   `~/.zpreztorc`, `~/.inputrc`, `~/.npmrc`, `~/.config/starship.toml`,
   `~/.config/direnv`, `~/.tmux.conf`, `~/.config/tmux/tmux.conf`, `~/.vimrc`,
-  `~/.config/nvim/init.lua` and `init.vim`, IPython
+  `~/.vim/vimrc`, `~/.config/vim/vimrc`, `~/.config/nvim/init.lua` and `init.vim`, IPython
   `profile_default/startup` and `ipython_config.py`, and the file that
   `$PYTHONSTARTUP` names. See
   [shell and tool startup code](#shell-and-tool-startup-code).
@@ -380,14 +380,14 @@ normal use:
 | `~/.config/starship.toml` | every prompt (custom `command` modules) | editing the prompt config |
 | `~/.config/direnv` | every `.envrc` (`direnvrc`, `lib/*.sh`; `direnv.toml` `whitelist` trusts `.envrc` files) | editing direnv config; the allow list (`~/.local/share/direnv`) stays writable |
 | `~/.tmux.conf`, `~/.config/tmux/tmux.conf` | every tmux server (`run-shell`, `if-shell`) | editing tmux config; `~/.tmux/plugins` stays writable |
-| `~/.vimrc`, `~/.config/nvim/init.lua`, `init.vim` | every vim/nvim | editing them; the rest of `~/.vim` and `~/.config/nvim` (`lua/`, `lazy-lock.json`) stays writable |
+| `~/.vimrc`, `~/.vim/vimrc`, `~/.config/vim/vimrc`, `~/.config/nvim/init.lua`, `init.vim` | every vim/nvim (vim reads the first of the three vimrc files that exists, so a missing one is protected too) | editing them. Not protected: `~/.vim/plugin/*.vim`, `~/.vim/pack/*/start/` and nvim `~/.config/nvim/plugin/` (and `lua/`, `lazy-lock.json`) stay writable, and vim/nvim run that code at every start |
 | IPython `~/.ipython/profile_default/startup`, `ipython_config.py` | every IPython | adding startup scripts; `ipython profile create` for the default profile |
 | the absolute path in `$PYTHONSTARTUP` at launch | every interactive Python | editing that file |
 
 These stay writable because the tools write them: fish `fish_variables`
 (`set -U`, and fish writes it at startup), the oh-my-zsh checkout and its
 `cache` (auto-update runs `git pull` in `~/.oh-my-zsh`; it does not touch
-`custom`), `~/.zprezto` (`zprezto-update`), nvim `lazy-lock.json` and IPython
+`custom` while upstream does not change its tracked example files there), `~/.zprezto` (`zprezto-update`), nvim `lazy-lock.json` and IPython
 history.
 
 **Not protected.** agent-aws does not parse rc files for `source` lines: the
@@ -487,26 +487,36 @@ runs. For these, use the
   This was not tested with the real
   Codex ([#8](https://github.com/juanheyns/agent-aws/issues/8)).
 - You cannot edit fish `config.fish`, `conf.d`, `functions` or `completions`;
-  `fisher install`/`update` and `funcsave` fail. `set -U` works on macOS. On
-  Linux, `~/.config/fish` is a private skeleton: fish replaces an existing
-  `fish_variables` by rename, which fails over the bind mount, so `set -U`
-  changes in a run are not saved; a new top-level entry there disappears
-  when the run ends. This was not tested with the real fish
-  ([#9](https://github.com/juanheyns/agent-aws/issues/9)).
+  `fisher install`/`update` and `funcsave` fail. `set -U` works on both
+  platforms: on Linux, `~/.config/fish` is bound read-write (like `~/.codex`)
+  and only the existing protected entries are bound read-only on top, so fish
+  can replace `fish_variables` by rename. The Linux cost: a missing
+  `config.fish`, `conf.d`, `functions` or `completions` can be created in a run
+  and stays on the host (macOS denies it). I guess that fish creates `conf.d`,
+  `functions` and `completions` at its first start, so they normally exist;
+  this was not verified. The same applies to `~/.oh-my-zsh` and its `custom`
+  directory.
 - `npm login`, `npm adduser`, `npm logout` and `npm config set`/`delete` fail
   (they write `~/.npmrc`). Use a project `.npmrc` or run them outside the
   sandbox.
 - You cannot add or edit oh-my-zsh custom plugins and themes, or edit
   `~/.zpreztorc`, `~/.inputrc`, `~/.config/starship.toml`, direnv config, tmux
-  config, `~/.vimrc`, nvim `init.lua`/`init.vim`, IPython startup scripts or
+  config, `~/.vimrc`, `~/.vim/vimrc`, `~/.config/vim/vimrc`, nvim `init.lua`/`init.vim`, IPython startup scripts or
   the `$PYTHONSTARTUP` file.
-- On macOS, a missing `~/.config/fish`, `~/.oh-my-zsh`, `~/.config/tmux`,
-  `~/.config/nvim` or `~/.ipython/profile_default` cannot be created in a run
-  (they are ancestors of protected paths). So installing oh-my-zsh, a first
-  fish start or a first IPython start in a run fails or cannot save its
-  state; do it once outside the sandbox. On Linux, these directories are
-  private skeletons: existing entries stay writable, new top-level entries
-  disappear when the run ends.
+- On macOS, a missing `~/.config/fish`, `~/.oh-my-zsh`, `~/.vim`,
+  `~/.config/vim`, `~/.config/tmux`, `~/.config/nvim` or
+  `~/.ipython/profile_default` cannot be created in a run (they are ancestors
+  of protected paths). So installing oh-my-zsh, a first fish start or a first
+  IPython start in a run fails or cannot save its state; do it once outside
+  the sandbox. On Linux, `~/.vim`, `~/.config/vim`, `~/.config/tmux`,
+  `~/.config/nvim` and `~/.ipython/profile_default` are private skeletons:
+  existing entries stay writable, but new top-level entries (for example a
+  `~/.vim/pack` directory that a plugin manager creates in a run) disappear
+  when the run ends.
+- oh-my-zsh auto-update (`omz update`, a `git pull`) works in a run on both
+  platforms while upstream does not change the files that it tracks in
+  `custom/` (`example.zsh`, `plugins/example`, `themes/example`). If it does,
+  the update fails, because `custom` is read-only.
 
 ### Not protected
 
@@ -519,7 +529,7 @@ with disposable fixtures that a run can still write these. Each one is tracked:
 | Git/SSH commands that are shell strings, and config that agent-aws does not parse | `!sh -c '…'` aliases, `ProxyCommand sh -c …`, a relative `core.hooksPath`, system git config, `/etc/ssh/ssh_config`, ssh `${VAR}` paths | [#6](https://github.com/juanheyns/agent-aws/issues/6) (decision: not resolvable in general; see [git and SSH config targets](#git-and-ssh-config-targets)) |
 | Repository-local configuration | `.git/config` (`core.fsmonitor`), `.git/hooks`, project `.claude/settings.json`, `.envrc` | [#7](https://github.com/juanheyns/agent-aws/issues/7) |
 | Agent config that the agent writes itself | `~/.claude.json` itself (a new `mcpServers` entry), `~/.claude/plugins/**`, `~/.codex/config.toml` itself (a new `mcp_servers` or `notify`), files that `~/.claude/CLAUDE.md` imports with `@path`, interpreter-prefixed hook commands, other agents (not surveyed); project config is [#7](https://github.com/juanheyns/agent-aws/issues/7) | [#8](https://github.com/juanheyns/agent-aws/issues/8) (needs a test with the real agents; see [agent instructions and config programs](#agent-instructions-and-config-programs)) |
-| Code sourced by startup files, other shells, tool config, other bin dirs | files that rc files source (`~/.zsh/*.zsh`, dotfile repositories), oh-my-zsh core files, `~/.zprezto`, zsh plugin managers, fish `fish_variables`, nushell/xonsh, editor and tool init that is not in the list, `~/bin` and `~/go/bin` not in PATH | [#9](https://github.com/juanheyns/agent-aws/issues/9) (decision: protect a short list; the rest needs the strong boundary, [#14](https://github.com/juanheyns/agent-aws/issues/14); see [shell and tool startup code](#shell-and-tool-startup-code)) |
+| Code sourced by startup files, other shells, tool config, other bin dirs | files that rc files source (`~/.zsh/*.zsh`, dotfile repositories), oh-my-zsh core files, `~/.zprezto`, zsh plugin managers, fish `fish_variables` and the user vendor directories `~/.local/share/fish/vendor_conf.d`, `vendor_functions.d` and `vendor_completions.d`, nushell/xonsh, editor and tool init that is not in the list, `~/bin` and `~/go/bin` not in PATH | [#9](https://github.com/juanheyns/agent-aws/issues/9) (decision: protect a short list; the rest needs the strong boundary, [#14](https://github.com/juanheyns/agent-aws/issues/14); see [shell and tool startup code](#shell-and-tool-startup-code)) |
 | Mutable dependencies outside protected trees | Homebrew `var/`, new prefix entries, nvm, uv, conda, mise | [#10](https://github.com/juanheyns/agent-aws/issues/10) |
 | macOS services that write for the caller, app autostart | cfprefsd (Terminal/iTerm2 startup command), Login Items, launchd jobs, iTerm2 AutoLaunch | [#11](https://github.com/juanheyns/agent-aws/issues/11) |
 | `aws` wrappers that are not Python scripts, shebangs that cannot be parsed | asdf/mise shims, shell wrappers, `#!python3` (relative) | [#12](https://github.com/juanheyns/agent-aws/issues/12) |

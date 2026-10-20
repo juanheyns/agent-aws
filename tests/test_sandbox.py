@@ -490,6 +490,7 @@ sys.exit(0 if rc == 0 else 1)
             ".config/fish/config.fish": "# fixture\n",
             ".config/fish/conf.d/existing.fish": "# fixture\n",
             ".config/fish/functions/fixture.fish": "# fixture\n",
+            ".config/fish/completions/fixture.fish": "# fixture\n",
             ".oh-my-zsh/custom/fixture.zsh": "# fixture\n",
             ".zpreztorc": "# fixture\n",
             ".npmrc": "registry=https://registry.example.invalid/\n",
@@ -517,19 +518,38 @@ sys.exit(0 if rc == 0 else 1)
             self.denied_all([f"echo 'curl evil' >> ~/{name}" for name in protected]
                             + ["echo 'curl evil' > ~/.config/fish/conf.d/evil.fish",
                                "echo 'curl evil' > ~/.config/fish/functions/ls.fish",
+                               "echo 'curl evil' > ~/.config/fish/completions/git.fish",
                                "echo 'curl evil' > ~/.oh-my-zsh/custom/evil.zsh",
                                "echo 'curl evil' > ~/.ipython/profile_default/startup/evil.py",
                                "echo 'node-options=--require /tmp/x.js' > ~/.npmrc"], label="ISSUE9")
-            # Missing startup files and directories cannot be planted.
-            for name, top in ((".config/fish/completions/git.fish", ".config/fish/completions"),
-                              (".config/tmux/tmux.conf", ".config/tmux"),
+            # Existing protected children and their parents cannot be renamed
+            # or unlinked (Linux: mount points, EBUSY).
+            for command in ("mv ~/.config/fish/conf.d ~/.config/fish/conf.d.old",
+                            "rm -rf ~/.config/fish/conf.d",
+                            "mv ~/.oh-my-zsh/custom ~/.oh-my-zsh/custom.old",
+                            "mv ~/.config/fish ~/.config/fish.old",
+                            "mv ~/.oh-my-zsh ~/.oh-my-zsh.old"):
+                result = self.run_shell(command)
+                print(f"ISSUE9 RENAME/UNLINK exit={result.returncode} {command} "
+                      f"[{result.stderr.strip()[:120]}]", flush=True)
+                self.assertNotEqual(result.returncode, 0, command)
+            # Missing startup files and directories cannot be planted. vim
+            # reads ~/.vim/vimrc or ~/.config/vim/vimrc when ~/.vimrc is
+            # missing (review round 1). On Linux ~/.config/fish and
+            # ~/.oh-my-zsh are bound read-write (LINUX_PARENT_BIND), so a
+            # missing child there can be created (documented); macOS denies it.
+            (home / ".vimrc").unlink()
+            missing = [(".vim/vimrc", ".vim"), (".config/vim/vimrc", ".config/vim"),
+                       (".config/tmux/tmux.conf", ".config/tmux"),
                               (".config/nvim/init.vim", ".config/nvim/init.vim"),
                               (".config/direnv/lib/evil.sh", ".config/direnv/lib"),
                               (".ipython/profile_default/ipython_config.py",
-                               ".ipython/profile_default/ipython_config.py")):
+                               ".ipython/profile_default/ipython_config.py")]
+            for name, top in missing:
                 self.not_persisted(f'mkdir -p "$(dirname "$HOME/{name}")" && '
                                    f'echo "run evil" > "$HOME/{name}"', home / top)
                 print(f"ISSUE9 NOT PERSISTED {name}", flush=True)
+            (home / ".vimrc").write_text(protected[".vimrc"])
             self.assert_unchanged(protected)
             # Positive controls: fish universal variables (`set -U`), the
             # oh-my-zsh checkout and cache, other ~/.config children and HOME files.
@@ -541,22 +561,35 @@ sys.exit(0 if rc == 0 else 1)
                 self.assertIn("ok", (home / name).read_text(), name)
             print("ISSUE9 CONTROLS WRITABLE: " + " ".join(f"~/{name}" for name in writable)
                   + " ~/.oh-my-zsh/cache/new ~/.config/other/new", flush=True)
-            if sys.platform == "darwin":
-                # fish saves universal variables to a temporary file and renames
-                # it. On Linux the rename onto a bind-mounted file fails (EBUSY).
-                result = self.run_shell("cd ~/.config/fish && echo 'SETUVAR x:1' > fish_variables.tmp"
-                                        " && mv fish_variables.tmp fish_variables")
+            # fish saves universal variables to a temporary file and renames
+            # it; `omz update` (git pull) replaces checkout files the same way.
+            # On Linux both directories are read-write binds, so this works.
+            result = self.run_shell("cd ~/.config/fish && echo 'SETUVAR x:1' > fish_variables.tmp"
+                                    " && mv fish_variables.tmp fish_variables"
+                                    " && cd ~/.oh-my-zsh && echo '# updated' > .oh-my-zsh.sh.tmp"
+                                    " && mv .oh-my-zsh.sh.tmp oh-my-zsh.sh")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("SETUVAR", (home / ".config/fish/fish_variables").read_text())
+            self.assertIn("updated", (home / ".oh-my-zsh/oh-my-zsh.sh").read_text())
+            print("ISSUE9 CONTROL WRITABLE: fish_variables and oh-my-zsh.sh replaced by rename",
+                  flush=True)
+            # A real fish (CI installs it on ubuntu): `set -U` in a run is saved.
+            fish = shutil.which("fish", path=self.env.get("PATH"))
+            if fish:
+                result = self.run_shell("fish -c 'set -U agent_aws_issue9 1'")
+                print(f"ISSUE9 REAL FISH set -U exit={result.returncode} "
+                      f"[{result.stderr.strip()[:200]}]", flush=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("SETUVAR", (home / ".config/fish/fish_variables").read_text())
-                print("ISSUE9 CONTROL WRITABLE: fish_variables replaced by rename", flush=True)
+                self.assertIn("agent_aws_issue9", (home / ".config/fish/fish_variables").read_text())
+                print("ISSUE9 REAL FISH: set -U persisted to the host fish_variables", flush=True)
         finally:
             del self.env["PYTHONSTARTUP"]
             for name in (".config/fish", ".config/other", ".config/direnv", ".config/nvim",
-                         ".config/tmux", ".oh-my-zsh", ".ipython"):
+                         ".config/tmux", ".config/vim", ".vim", ".oh-my-zsh", ".ipython"):
                 shutil.rmtree(home / name, ignore_errors=True)
             for name in (".zpreztorc", ".npmrc", ".inputrc", ".config/starship.toml", ".tmux.conf",
                          ".vimrc", ".pythonrc.py", "unrelated.txt"):
-                (home / name).unlink()
+                (home / name).unlink(missing_ok=True)
 
     def test_issue4_homebrew_prefix_dependencies(self):
         # Scratch model of a user-owned Homebrew prefix: PATH holds symlinks

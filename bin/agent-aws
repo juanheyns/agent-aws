@@ -73,17 +73,20 @@ STARTUP_PATHS = (
     ".config/fish/completions", ".oh-my-zsh/custom", ".zpreztorc", ".inputrc",
     ".npmrc", ".config/starship.toml", ".config/direnv",
     ".tmux.conf", ".config/tmux/tmux.conf",
-    ".vimrc", ".config/nvim/init.lua", ".config/nvim/init.vim",
+    # vim reads the first of these three that exists, so protect all of them.
+    ".vimrc", ".vim/vimrc", ".config/vim/vimrc",
+    ".config/nvim/init.lua", ".config/nvim/init.vim",
     ".ipython/profile_default/startup", ".ipython/profile_default/ipython_config.py",
 )
 # Linux: HOME-relative directories that are bound read-write instead of made
 # a private skeleton, with their existing protected children bound read-only
 # on top. Use it for a directory whose own files the agents replace by rename
-# (~/.codex/config.toml). The directory and each existing protected child are
+# (~/.codex/config.toml, fish fish_variables on `set -U`, oh-my-zsh files on
+# `omz update`). The directory and each existing protected child are
 # mount points, so neither can be renamed or unlinked. Cost: a missing
 # protected child can be created on the host. Not used (skeleton instead)
 # when a protected child is a symlink. See linux_parent_binds().
-LINUX_PARENT_BIND = (".codex",)
+LINUX_PARENT_BIND = (".codex", ".config/fish", ".oh-my-zsh")
 # Asked of the interpreter named by a Python `aws` script. -I -S: no site,
 # user-site or working-directory code runs while answering.
 PYTHON_PATHS_PROBE = (
@@ -863,8 +866,14 @@ def agent_config_paths():
 
 
 def config_targets():
-    """Files and programs that the protected git, ssh (#6) and agent (#8) config refer to."""
-    return git_config_paths() | ssh_config_paths() | agent_config_paths()
+    """Files and programs that the protected git, ssh (#6) and agent (#8)
+    config refer to, and the file that $PYTHONSTARTUP names (#9): it runs in
+    every interactive Python."""
+    targets = git_config_paths() | ssh_config_paths() | agent_config_paths()
+    startup = os.environ.get("PYTHONSTARTUP", "")
+    if os.path.isabs(startup):
+        targets |= usable_targets({Path(startup)})
+    return targets
 
 
 def protected_paths(targets=None):
@@ -895,10 +904,6 @@ def protected_paths(targets=None):
                 paths.add(prefix if prefix != HOME else path.resolve().parent)
     paths.update((Path(sys.prefix), Path(sys.base_prefix)))
     paths.update(config_targets() if targets is None else targets)
-    # The file that $PYTHONSTARTUP names runs in every interactive Python (#9).
-    startup = os.environ.get("PYTHONSTARTUP", "")
-    if os.path.isabs(startup):
-        paths.update(usable_targets({Path(startup)}))
     aws = shutil.which("aws", path=executable_path())
     python = aws and script_python(Path(aws).resolve())
     if python:
@@ -1013,7 +1018,8 @@ def linux_home_mounts(protected=None):
 
 def linux_target_skeletons(protected, targets):
     """Directories that linux_home_mounts() makes private skeletons only
-    because a git/ssh (#6) or agent (#8) config target is below them.
+    because a git/ssh (#6) or agent (#8) config target or the
+    $PYTHONSTARTUP file (#9) is below them.
 
     Every directory between HOME and a target is a skeleton (also when the
     target is missing): new top-level entries in it are lost when the run
@@ -1037,7 +1043,7 @@ def linux_skeleton_note(protected, targets):
     if skeletons:
         names = ", ".join(f"~/{path.relative_to(HOME)}" for path in skeletons)
         print("agent-aws: Linux: new top-level entries in these directories are lost when "
-              f"the run ends (they hold protected git/ssh/agent config targets): {names}",
+              f"the run ends (they hold protected git/ssh/agent config or $PYTHONSTARTUP targets): {names}",
               file=sys.stderr)
 
 
