@@ -15,8 +15,10 @@ Layered design:
 import argparse
 import configparser
 import errno
+import glob
 import json
 import os
+import re
 import shlex
 import shutil
 import site
@@ -66,6 +68,39 @@ PYTHON_NAMES = ("python", "pypy")
 # longer than the kernel shebang limit or contains spaces.
 TRAMPOLINE = "'''exec' "
 INSTALL_DIR = SCRIPT_DIR.parent
+# Git config targets (issue #6). Git stops at include depth 10; ssh at 16.
+GIT_TIMEOUT = 10
+GIT_INCLUDE_DEPTH = 10
+SSH_INCLUDE_DEPTH = 16
+# section -> variable names whose value is a command that a later,
+# unsandboxed git runs. None: every variable in the section (pager.<cmd>,
+# alias.<name>). Keys with a subsection (diff.<driver>.textconv) match by
+# their section and last part. Not complete forever: new git releases add
+# keys (check `git help config` for "command" when git is upgraded).
+GIT_COMMAND_KEYS = {
+    "core": {"fsmonitor", "sshcommand", "pager", "editor", "askpass", "gitproxy",
+             "alternaterefscommand"},
+    "credential": {"helper"},
+    "sequence": {"editor"},
+    "gpg": {"program", "defaultkeycommand"},
+    "hook": {"command"},
+    "interactive": {"difffilter"},
+    "trailer": {"command", "cmd"},
+    "remote": {"uploadpack", "receivepack"},
+    "diff": {"external", "textconv", "command"},
+    "filter": {"clean", "smudge", "process"},
+    "merge": {"driver"},
+    "mergetool": {"cmd", "path"},
+    "difftool": {"cmd", "path"},
+    "man": {"cmd", "path"},
+    "browser": {"cmd", "path"},
+    "sendemail": {"smtpserver", "sendmailcmd", "tocmd", "cccmd", "headercmd"},
+    "uploadpack": {"packobjectshook"},
+    "pager": None,
+    "alias": None,
+}
+SSH_COMMAND_KEYWORDS = ("proxycommand", "localcommand", "knownhostscommand")
+SSH_LIBRARY_KEYWORDS = ("pkcs11provider", "securitykeyprovider")
 
 IS_MACOS = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
@@ -507,7 +542,231 @@ def venv_paths(python):
     return paths
 
 
-def protected_paths():
+def warn(msg):
+    print(f"agent-aws: warning: {msg}", file=sys.stderr)
+
+
+def home_path(text):
+    """Expand `~/` and `~user/` as git and ssh do; other text is unchanged."""
+    if text == "~" or text.startswith("~/"):
+        return HOME / text[2:]
+    return Path(os.path.expanduser(text) if text.startswith("~") else text)
+
+
+def command_program(command):
+    """Return the program of a configured command if it is an absolute or ~ path.
+
+    Takes the first word (shlex), after a git `!` and a leading `exec`. Bare
+    names resolve through PATH, which is protected. Other shell syntax
+    (`sh -c '...'`, functions, variables) cannot be resolved: None.
+    """
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return None
+    if words and words[0].startswith("!"):
+        words[0] = words[0][1:]
+        if not words[0]:
+            words.pop(0)
+    if words and words[0] == "exec":
+        words.pop(0)
+    path = home_path(words[0]) if words else None
+    return Path(os.path.normpath(path)) if path and path.is_absolute() else None
+
+
+def usable_targets(paths):
+    # Never protect HOME or an ancestor (#5 guard), and skip paths below an
+    # existing file: they cannot exist, and the Linux skeleton needs dirs.
+    return {path for path in paths
+            if path.is_absolute() and path != HOME and path not in HOME.parents
+            and not any(parent.exists() and not parent.is_dir() for parent in path.parents)}
+
+
+def git_config_entries(git, args, cwd, env, show_origin=False):
+    """Return ([(origin, key, value)], None) from `git config -z`, or (None, error)."""
+    try:
+        result = subprocess.run([git, "--no-pager", "config", "-z", *args], cwd=cwd, env=env,
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=GIT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, str(exc)
+    if result.returncode:
+        return None, os.fsdecode(result.stderr).strip() or f"exit {result.returncode}"
+    items = os.fsdecode(result.stdout).split("\0")[:-1]
+    pairs = zip(items[0::2], items[1::2]) if show_origin else ((None, item) for item in items)
+    entries = []
+    for origin, item in pairs:
+        key, newline, value = item.partition("\n")
+        entries.append((origin, key, value if newline else None))
+    return entries, None
+
+
+def include_targets(config_file, value):
+    # Git resolves a relative include path against the including file's
+    # directory. %(prefix)/ is relative to git's installation prefix.
+    if value.startswith("%(prefix)/"):
+        return []
+    target = home_path(value)
+    bases = {config_file.parent, config_file.resolve().parent}
+    return [Path(os.path.normpath(target if target.is_absolute() else base / target))
+            for base in bases]
+
+
+def git_config_paths():
+    """Files, hook directories and helper programs that global git config names.
+
+    Every file is read with --no-includes and every include.path and
+    includeIf.*.path is followed, whatever its condition. Git itself also
+    lists the files it includes from a cwd outside any repository.
+    `git config --list` reads config only: it runs no helper, pager or hook.
+    """
+    files = {HOME / ".gitconfig", HOME / ".config/git/config"}
+    paths = set()
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg and os.path.isabs(xdg):
+        paths.add(Path(xdg) / "git")
+        files.add(Path(xdg) / "git/config")
+    # The files that `git config --global` reads in this environment.
+    effective = files - {HOME / ".config/git/config"} if xdg and os.path.isabs(xdg) else set(files)
+    if os.environ.get("GIT_CONFIG_GLOBAL"):
+        effective = {Path(os.path.abspath(home_path(os.environ["GIT_CONFIG_GLOBAL"])))}
+        files |= effective
+    paths.update(files)
+    git = shutil.which("git", path=executable_path())
+    if not git:
+        if any(path.exists() for path in files):
+            warn("git not found in PATH; git include targets, core.hooksPath and helper "
+                 "programs are not protected")
+        return usable_targets(paths)
+    failures = []
+    queue = [(path, 0) for path in sorted(files)]
+    with tempfile.TemporaryDirectory(prefix="agent-aws-git.") as cwd:
+        env = {"HOME": str(HOME), "PATH": executable_path(), "LC_ALL": "C",
+               "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat",
+               "GIT_CEILING_DIRECTORIES": str(Path(cwd).resolve().parent)}
+        if any(path.is_file() for path in effective):
+            entries, error = git_config_entries(
+                git, ["--global", "--list", "--show-origin", "--includes"], cwd,
+                dict(env, **{name: os.environ[name] for name in ("GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME")
+                             if os.environ.get(name)}), show_origin=True)
+            if entries is None:
+                failures.append(("--global", error))
+            queue += [(Path(origin[5:]), 0) for origin, _, _ in entries or ()
+                      if origin.startswith("file:") and os.path.isabs(origin[5:])]
+        # Each file alone: the global config does not apply to these reads.
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        seen = set()
+        while queue:
+            path, depth = queue.pop(0)
+            if path in seen or depth > GIT_INCLUDE_DEPTH:
+                continue
+            seen.add(path)
+            paths.add(path)
+            if not path.is_file():
+                continue
+            entries, error = git_config_entries(git, ["--file", str(path), "--no-includes", "--list"],
+                                                cwd, env)
+            if entries is None:
+                failures.append((path, error))
+                continue
+            for _, key, value in entries:
+                if not value:
+                    continue
+                section, name = key.split(".", 1)[0], key.rsplit(".", 1)[-1]
+                if section in ("include", "includeif") and name == "path":
+                    queue += [(target, depth + 1) for target in include_targets(path, value)]
+                elif key in ("core.hookspath", "init.templatedir"):
+                    # Hook directories: `git init` copies hooks from the
+                    # template directory. A relative hooksPath is relative
+                    # to each repository.
+                    target = home_path(value)
+                    if target.is_absolute():
+                        paths.add(Path(os.path.normpath(target)))
+                elif section in GIT_COMMAND_KEYS and (GIT_COMMAND_KEYS[section] is None
+                                                      or name in GIT_COMMAND_KEYS[section]):
+                    program = command_program(value)
+                    if program:
+                        paths.add(program)
+    for what, error in failures:
+        warn(f"cannot read git config {what} ({error}); its include targets, core.hooksPath, "
+             "init.templateDir and helper programs are not protected")
+    return usable_targets(paths)
+
+
+SSH_LINE = re.compile(r"\s*([A-Za-z][A-Za-z0-9]*)(?:\s*=\s*|\s+)(.*)")
+GLOB_MAGIC = re.compile(r"[*?[]")
+
+
+def ssh_config_paths():
+    """Include targets and programs that ~/.ssh/config names (a partial parse).
+
+    Parsed: Include (~, relative to ~/.ssh, globs; recursively and whatever
+    the Host/Match block), the first word of ProxyCommand, LocalCommand,
+    KnownHostsCommand and Match [!]exec when it is an absolute or ~ path, and
+    PKCS11Provider / SecurityKeyProvider libraries. `ssh -G` is not used: it
+    evaluates `Match exec`, so it runs commands.
+    """
+    ssh_dir = HOME / ".ssh"
+    paths = set()
+    queue = [(ssh_dir / "config", 0)]
+    seen = set()
+    while queue:
+        path, depth = queue.pop(0)
+        if path in seen or depth > SSH_INCLUDE_DEPTH:
+            continue
+        seen.add(path)
+        paths.add(path)
+        try:
+            if not path.is_file():
+                continue
+            with open(path, errors="replace") as f:
+                text = f.read(1 << 20)
+        except OSError:
+            continue
+        for line in text.splitlines():
+            match = SSH_LINE.match(line)
+            if not match:
+                continue
+            keyword, args = match.group(1).lower(), match.group(2).strip()
+            try:
+                words = shlex.split(args)
+            except ValueError:
+                continue
+            programs = []
+            if keyword == "include":
+                for word in words:
+                    pattern = home_path(word)
+                    pattern = Path(os.path.normpath(pattern if pattern.is_absolute()
+                                                    else ssh_dir / pattern))
+                    if not GLOB_MAGIC.search(str(pattern)):
+                        queue.append((pattern, depth + 1))
+                        continue
+                    queue += [(Path(name), depth + 1) for name in sorted(glob.glob(str(pattern)))]
+                    # Protect the directory above the first glob part, so that
+                    # new matches cannot be planted (not ~/.ssh: known_hosts).
+                    fixed = Path(pattern.anchor)
+                    for part in pattern.parts[1:]:
+                        if GLOB_MAGIC.search(part):
+                            break
+                        fixed /= part
+                    if fixed != ssh_dir:
+                        paths.add(fixed)
+            elif keyword in SSH_COMMAND_KEYWORDS:
+                programs.append(args)
+            elif keyword == "match":
+                programs += [command for criterion, command in zip(words, words[1:])
+                             if criterion.lower() in ("exec", "!exec")]
+            elif keyword in SSH_LIBRARY_KEYWORDS and words:
+                programs.append(shlex.quote(words[0]))
+            paths.update(filter(None, map(command_program, programs)))
+    return usable_targets(paths)
+
+
+def config_targets():
+    """Files and programs that the protected git and ssh config refer to (#6)."""
+    return git_config_paths() | ssh_config_paths()
+
+
+def protected_paths(targets=None):
     paths = {HOME / path for path in STARTUP_PATHS}
     paths.update((INSTALL_DIR, AWS_DIR, AGENT_DIR))
     # -I prevents user-site startup code; also prevent planting it for other
@@ -534,6 +793,7 @@ def protected_paths():
                 prefix = path.resolve().parent.parent
                 paths.add(prefix if prefix != HOME else path.resolve().parent)
     paths.update((Path(sys.prefix), Path(sys.base_prefix)))
+    paths.update(config_targets() if targets is None else targets)
     aws = shutil.which("aws", path=executable_path())
     python = aws and script_python(Path(aws).resolve())
     if python:
@@ -614,6 +874,33 @@ def linux_home_mounts(protected=None):
     return argv
 
 
+def linux_target_skeletons(protected, targets):
+    """Directories that linux_home_mounts() makes private skeletons only
+    because a git/ssh config target (#6) is below them.
+
+    Every directory between HOME and a target is a skeleton (also when the
+    target is missing): new top-level entries in it are lost when the run
+    ends, and its existing entries are mount points (no rename or unlink).
+    """
+    targets = set(targets) | {path.resolve() for path in targets}
+
+    def containers(paths):
+        return {parent for path in paths for parent in path.parents if HOME in parent.parents}
+
+    skeletons = containers(targets) - containers(set(protected) - targets)
+    # A directory below a protected path is read-only, not a skeleton.
+    return sorted(path for path in skeletons
+                  if not any(part in protected for part in (path, *path.parents)))
+
+
+def linux_skeleton_note(protected, targets):
+    skeletons = linux_target_skeletons(protected, targets)
+    if skeletons:
+        names = ", ".join(f"~/{path.relative_to(HOME)}" for path in skeletons)
+        print("agent-aws: Linux: new top-level entries in these directories are lost when "
+              f"the run ends (they hold protected git/ssh targets): {names}", file=sys.stderr)
+
+
 def build_sandbox_argv_linux(creds_dir, protected=None):
     return [
         "bwrap",
@@ -677,7 +964,10 @@ def cmd_run(args):
     AGENT_DIR.mkdir(mode=0o700, exist_ok=True)
     # The interpreter probe can fail closed (die). Decide on the protected
     # paths before any SSO token is read or handed to `aws`.
-    protected = protected_paths()
+    targets = config_targets()
+    protected = protected_paths(targets)
+    if IS_LINUX:
+        linux_skeleton_note(protected, targets)
 
     creds_dir = Path(tempfile.mkdtemp(prefix="agent-aws.", dir="/tmp"))
     cred_file = creds_dir / "credentials"
