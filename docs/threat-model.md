@@ -215,6 +215,14 @@ list of known paths. It does not block it in general.
   `statusLine` and helper commands, MCP server commands in `~/.claude.json`,
   and Codex `mcp_servers` and `notify` programs. See
   [agent instructions and config programs](#agent-instructions-and-config-programs).
+- Other shells' and tools' startup code: fish `~/.config/fish/config.fish`,
+  `conf.d`, `functions` and `completions`; `~/.oh-my-zsh/custom`,
+  `~/.zpreztorc`, `~/.inputrc`, `~/.npmrc`, `~/.config/starship.toml`,
+  `~/.config/direnv`, `~/.tmux.conf`, `~/.config/tmux/tmux.conf`, `~/.vimrc`,
+  `~/.config/nvim/init.lua` and `init.vim`, IPython
+  `profile_default/startup` and `ipython_config.py`, and the file that
+  `$PYTHONSTARTUP` names. See
+  [shell and tool startup code](#shell-and-tool-startup-code).
 - Executables and code that the wrapper or a later shell runs: every
   launch-PATH directory, the agent-aws installation and launcher, the Python
   interpreter, its site-packages and user site, the `aws` and `python3`
@@ -354,6 +362,51 @@ config ([#7](https://github.com/juanheyns/agent-aws/issues/7)),
 `~/.claude/output-styles`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME` (agent-aws
 reads only `~/.claude` and `~/.codex`), and other agents (not surveyed).
 
+### Shell and tool startup code
+
+Later, unsandboxed shells and tools run code from more files than the shell
+rc files ([#9](https://github.com/juanheyns/agent-aws/issues/9)). This list
+has no end, and each entry costs legitimate use, so agent-aws protects only
+files that a tool reads as code at startup and that the tool does not write in
+normal use:
+
+| Protected | Runs when | Legitimate use that fails in a run |
+|---|---|---|
+| `~/.config/fish/config.fish`, `conf.d`, `functions`, `completions` | every fish shell | editing fish config; `fisher install`/`update` and `funcsave` (they write `functions`, `conf.d`, `completions`) |
+| `~/.oh-my-zsh/custom` | every zsh with oh-my-zsh | adding or editing custom plugins and themes |
+| `~/.zpreztorc` | every zsh with prezto | editing the prezto config |
+| `~/.inputrc` | every readline program (a key macro can type a command) | editing readline bindings |
+| `~/.npmrc` | every `npm`/`npx` (`node-options`, `script-shell`) | `npm login`, `npm adduser`, `npm logout`, `npm config set`/`delete` |
+| `~/.config/starship.toml` | every prompt (custom `command` modules) | editing the prompt config |
+| `~/.config/direnv` | every `.envrc` (`direnvrc`, `lib/*.sh`; `direnv.toml` `whitelist` trusts `.envrc` files) | editing direnv config; the allow list (`~/.local/share/direnv`) stays writable |
+| `~/.tmux.conf`, `~/.config/tmux/tmux.conf` | every tmux server (`run-shell`, `if-shell`) | editing tmux config; `~/.tmux/plugins` stays writable |
+| `~/.vimrc`, `~/.config/nvim/init.lua`, `init.vim` | every vim/nvim | editing them; the rest of `~/.vim` and `~/.config/nvim` (`lua/`, `lazy-lock.json`) stays writable |
+| IPython `~/.ipython/profile_default/startup`, `ipython_config.py` | every IPython | adding startup scripts; `ipython profile create` for the default profile |
+| the absolute path in `$PYTHONSTARTUP` at launch | every interactive Python | editing that file |
+
+These stay writable because the tools write them: fish `fish_variables`
+(`set -U`, and fish writes it at startup), the oh-my-zsh checkout and its
+`cache` (auto-update runs `git pull` in `~/.oh-my-zsh`; it does not touch
+`custom`), `~/.zprezto` (`zprezto-update`), nvim `lazy-lock.json` and IPython
+history.
+
+**Not protected.** agent-aws does not parse rc files for `source` lines: the
+set of files that they can load has no end. So these stay writable: files that
+a protected rc file sources (`~/.zsh/*.zsh`, a dotfiles repository), the
+oh-my-zsh core files (`oh-my-zsh.sh`, `lib`, `plugins`, `themes`: a run can
+change them, and the next zsh runs them), the `~/.zprezto` checkout, zsh plugin
+managers (antigen, zinit, zplug, antidote), fish `fish_variables` (a
+universal `fish_user_paths` or `fish_function_path` changes what later fish
+shells run) and `fish_plugins` (the next `fisher update` installs from it),
+nushell and xonsh config, `~/.tmux/plugins`, vim/nvim plugins and `lua/`
+modules, other editor and tool init that is not in the table, a `PYTHONSTARTUP`
+that a later shell sets differently, `ZDOTDIR` and `XDG_CONFIG_HOME` other than
+the defaults, and bin directories that are not in the launch PATH (`~/bin`,
+`~/go/bin`, `~/.npm-global/bin`), which a later shell with a different PATH
+runs. For these, use the
+[strong boundary](#supported-host-isolation-boundary)
+([#14](https://github.com/juanheyns/agent-aws/issues/14)).
+
 ### What normal use now breaks inside a run
 
 - You cannot edit an included git config file, a script in the
@@ -433,6 +486,27 @@ reads only `~/.claude` and `~/.codex`), and other agents (not surveyed).
   would fail to start, or `rm` plus a new file would persist on the host.
   This was not tested with the real
   Codex ([#8](https://github.com/juanheyns/agent-aws/issues/8)).
+- You cannot edit fish `config.fish`, `conf.d`, `functions` or `completions`;
+  `fisher install`/`update` and `funcsave` fail. `set -U` works on macOS. On
+  Linux, `~/.config/fish` is a private skeleton: fish replaces an existing
+  `fish_variables` by rename, which fails over the bind mount, so `set -U`
+  changes in a run are not saved; a new top-level entry there disappears
+  when the run ends. This was not tested with the real fish
+  ([#9](https://github.com/juanheyns/agent-aws/issues/9)).
+- `npm login`, `npm adduser`, `npm logout` and `npm config set`/`delete` fail
+  (they write `~/.npmrc`). Use a project `.npmrc` or run them outside the
+  sandbox.
+- You cannot add or edit oh-my-zsh custom plugins and themes, or edit
+  `~/.zpreztorc`, `~/.inputrc`, `~/.config/starship.toml`, direnv config, tmux
+  config, `~/.vimrc`, nvim `init.lua`/`init.vim`, IPython startup scripts or
+  the `$PYTHONSTARTUP` file.
+- On macOS, a missing `~/.config/fish`, `~/.oh-my-zsh`, `~/.config/tmux`,
+  `~/.config/nvim` or `~/.ipython/profile_default` cannot be created in a run
+  (they are ancestors of protected paths). So installing oh-my-zsh, a first
+  fish start or a first IPython start in a run fails or cannot save its
+  state; do it once outside the sandbox. On Linux, these directories are
+  private skeletons: existing entries stay writable, new top-level entries
+  disappear when the run ends.
 
 ### Not protected
 
@@ -445,7 +519,7 @@ with disposable fixtures that a run can still write these. Each one is tracked:
 | Git/SSH commands that are shell strings, and config that agent-aws does not parse | `!sh -c '…'` aliases, `ProxyCommand sh -c …`, a relative `core.hooksPath`, system git config, `/etc/ssh/ssh_config`, ssh `${VAR}` paths | [#6](https://github.com/juanheyns/agent-aws/issues/6) (decision: not resolvable in general; see [git and SSH config targets](#git-and-ssh-config-targets)) |
 | Repository-local configuration | `.git/config` (`core.fsmonitor`), `.git/hooks`, project `.claude/settings.json`, `.envrc` | [#7](https://github.com/juanheyns/agent-aws/issues/7) |
 | Agent config that the agent writes itself | `~/.claude.json` itself (a new `mcpServers` entry), `~/.claude/plugins/**`, `~/.codex/config.toml` itself (a new `mcp_servers` or `notify`), files that `~/.claude/CLAUDE.md` imports with `@path`, interpreter-prefixed hook commands, other agents (not surveyed); project config is [#7](https://github.com/juanheyns/agent-aws/issues/7) | [#8](https://github.com/juanheyns/agent-aws/issues/8) (needs a test with the real agents; see [agent instructions and config programs](#agent-instructions-and-config-programs)) |
-| Code sourced by startup files, other shells, tool config, other bin dirs | `~/.oh-my-zsh/custom`, `~/.config/fish`, `~/.npmrc`, `~/bin` not in PATH | [#9](https://github.com/juanheyns/agent-aws/issues/9) |
+| Code sourced by startup files, other shells, tool config, other bin dirs | files that rc files source (`~/.zsh/*.zsh`, dotfile repositories), oh-my-zsh core files, `~/.zprezto`, zsh plugin managers, fish `fish_variables`, nushell/xonsh, editor and tool init that is not in the list, `~/bin` and `~/go/bin` not in PATH | [#9](https://github.com/juanheyns/agent-aws/issues/9) (decision: protect a short list; the rest needs the strong boundary, [#14](https://github.com/juanheyns/agent-aws/issues/14); see [shell and tool startup code](#shell-and-tool-startup-code)) |
 | Mutable dependencies outside protected trees | Homebrew `var/`, new prefix entries, nvm, uv, conda, mise | [#10](https://github.com/juanheyns/agent-aws/issues/10) |
 | macOS services that write for the caller, app autostart | cfprefsd (Terminal/iTerm2 startup command), Login Items, launchd jobs, iTerm2 AutoLaunch | [#11](https://github.com/juanheyns/agent-aws/issues/11) |
 | `aws` wrappers that are not Python scripts, shebangs that cannot be parsed | asdf/mise shims, shell wrappers, `#!python3` (relative) | [#12](https://github.com/juanheyns/agent-aws/issues/12) |

@@ -38,6 +38,9 @@ Claude Code settings (`~/.claude/settings.json`,
 `AGENTS.override.md`) and the programs that the agent config names (hooks, MCP
 servers, Codex `notify`; see
 [agent instructions and config programs](threat-model.md#agent-instructions-and-config-programs)),
+other shells' and tools' startup code (fish `config.fish`, `conf.d`,
+`functions`, `completions`, `~/.oh-my-zsh/custom`, `~/.npmrc` and others; see
+[shell and tool startup code](threat-model.md#shell-and-tool-startup-code)),
 and the resolved installation directory are
 denied. Generated rules protect conventional paths, resolved targets, and every
 ancestor against rename. Launch PATH directories, launcher paths, the
@@ -56,7 +59,10 @@ inside a run**. On a fresh account, the first `ssh` (which creates
 `~/.ssh/known_hosts`), the first `claude` (which creates `~/.claude/projects`)
 or the first `codex` fails in the sandbox. Run `ssh`, `claude` and `codex`
 once outside the sandbox first. After that,
-`known_hosts` and `~/.claude/projects` stay writable.
+`known_hosts` and `~/.claude/projects` stay writable. The same applies to
+`~/.config/fish`, `~/.oh-my-zsh`, `~/.config/tmux`, `~/.config/nvim` and
+`~/.ipython/profile_default`: install oh-my-zsh and start fish and IPython
+once outside the sandbox.
 
 `sandbox-exec` is technically deprecated by Apple but has shown no signs of
 removal in years; Apple uses it themselves for App Sandbox. If it ever does
@@ -83,7 +89,7 @@ Networking is still shared; the egress lock is a separate future step.
 Existing shell startup files, `~/.config/brnr`, `~/Library/LaunchAgents`, git
 and SSH configuration and the files and programs that it refers to, Claude
 Code settings, user-level agent instructions and the programs that the agent
-config names, and the installation directory are mounted read-only. A private directory skeleton
+config names, the shell and tool startup code, and the installation directory are mounted read-only. A private directory skeleton
 for HOME and the parents of protected paths prevents a missing protected path
 from being created persistently on the host. Linux also protects systemd user
 units and autostart entries. Existing ordinary children (such as project
@@ -107,7 +113,10 @@ it is bound read-write and only its existing `AGENTS.md` and
 run on Linux (macOS denies it). If one of these instruction files is a
 symlink (for example into a dotfiles repo), `~/.codex` stays a skeleton: new
 top-level entries in it are lost when the run ends, and a rename-replace of
-`config.toml` fails. An existing top-level entry in a skeleton directory is a
+`config.toml` fails. `~/.config/fish` and
+`~/.oh-my-zsh` are skeletons too: an existing `fish_variables` stays writable
+in place, but fish replaces it by rename, which fails over the bind mount, so
+`set -U` changes in a run are not saved. An existing top-level entry in a skeleton directory is a
 bind mount: it cannot be replaced by rename or unlinked. At run start,
 agent-aws prints the skeleton directories that come from git, SSH and agent config targets.
 The reason is in the

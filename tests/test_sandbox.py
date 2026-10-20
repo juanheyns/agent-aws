@@ -480,6 +480,84 @@ sys.exit(0 if rc == 0 else 1)
             for name in (".codex", "dotfiles"):
                 shutil.rmtree(home / name)
 
+    def test_issue9_shell_and_tool_startup_code(self):
+        # Issue #9: fish startup files, oh-my-zsh custom code, ~/.npmrc and
+        # other tool startup files that later unsandboxed shells and tools run
+        # were writable. State that the tools write (fish_variables, the
+        # oh-my-zsh checkout and cache) stays writable.
+        home = self.home
+        protected = {
+            ".config/fish/config.fish": "# fixture\n",
+            ".config/fish/conf.d/existing.fish": "# fixture\n",
+            ".config/fish/functions/fixture.fish": "# fixture\n",
+            ".oh-my-zsh/custom/fixture.zsh": "# fixture\n",
+            ".zpreztorc": "# fixture\n",
+            ".npmrc": "registry=https://registry.example.invalid/\n",
+            ".inputrc": "set editing-mode emacs\n",
+            ".config/starship.toml": "# fixture\n",
+            ".config/direnv/direnvrc": "# fixture\n",
+            ".tmux.conf": "# fixture\n",
+            ".vimrc": "\" fixture\n",
+            ".config/nvim/init.lua": "-- fixture\n",
+            ".ipython/profile_default/startup/00-fixture.py": "# fixture\n",
+            ".pythonrc.py": "# fixture\n",
+        }
+        writable = {".config/fish/fish_variables": "# fixture\n",
+                    ".config/other/settings": "# sentinel\n",
+                    ".oh-my-zsh/oh-my-zsh.sh": "# fixture\n",
+                    ".oh-my-zsh/cache/.zsh-update": "# fixture\n",
+                    ".config/nvim/lazy-lock.json": "{}\n",
+                    ".ipython/profile_default/history.sqlite": "fixture\n",
+                    "unrelated.txt": "# sentinel\n"}
+        self.write_fixtures({**protected, **writable})
+        # $PYTHONSTARTUP of the launching shell names a file that runs in
+        # every interactive Python.
+        self.env["PYTHONSTARTUP"] = str(home / ".pythonrc.py")
+        try:
+            self.denied_all([f"echo 'curl evil' >> ~/{name}" for name in protected]
+                            + ["echo 'curl evil' > ~/.config/fish/conf.d/evil.fish",
+                               "echo 'curl evil' > ~/.config/fish/functions/ls.fish",
+                               "echo 'curl evil' > ~/.oh-my-zsh/custom/evil.zsh",
+                               "echo 'curl evil' > ~/.ipython/profile_default/startup/evil.py",
+                               "echo 'node-options=--require /tmp/x.js' > ~/.npmrc"], label="ISSUE9")
+            # Missing startup files and directories cannot be planted.
+            for name, top in ((".config/fish/completions/git.fish", ".config/fish/completions"),
+                              (".config/tmux/tmux.conf", ".config/tmux"),
+                              (".config/nvim/init.vim", ".config/nvim/init.vim"),
+                              (".config/direnv/lib/evil.sh", ".config/direnv/lib"),
+                              (".ipython/profile_default/ipython_config.py",
+                               ".ipython/profile_default/ipython_config.py")):
+                self.not_persisted(f'mkdir -p "$(dirname "$HOME/{name}")" && '
+                                   f'echo "run evil" > "$HOME/{name}"', home / top)
+                print(f"ISSUE9 NOT PERSISTED {name}", flush=True)
+            self.assert_unchanged(protected)
+            # Positive controls: fish universal variables (`set -U`), the
+            # oh-my-zsh checkout and cache, other ~/.config children and HOME files.
+            result = self.run_shell(" && ".join(
+                [f"echo ok >> ~/{name}" for name in writable]
+                + ["echo ok > ~/.oh-my-zsh/cache/new", "echo ok > ~/.config/other/new"]))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for name in [*writable, ".oh-my-zsh/cache/new", ".config/other/new"]:
+                self.assertIn("ok", (home / name).read_text(), name)
+            print("ISSUE9 CONTROLS WRITABLE: " + " ".join(f"~/{name}" for name in writable)
+                  + " ~/.oh-my-zsh/cache/new ~/.config/other/new", flush=True)
+            if sys.platform == "darwin":
+                # fish saves universal variables to a temporary file and renames
+                # it. On Linux the rename onto a bind-mounted file fails (EBUSY).
+                result = self.run_shell("cd ~/.config/fish && echo 'SETUVAR x:1' > fish_variables.tmp"
+                                        " && mv fish_variables.tmp fish_variables")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("SETUVAR", (home / ".config/fish/fish_variables").read_text())
+                print("ISSUE9 CONTROL WRITABLE: fish_variables replaced by rename", flush=True)
+        finally:
+            del self.env["PYTHONSTARTUP"]
+            for name in (".config/fish", ".config/other", ".config/direnv", ".config/nvim",
+                         ".config/tmux", ".oh-my-zsh", ".ipython"):
+                shutil.rmtree(home / name, ignore_errors=True)
+            for name in (".zpreztorc", ".npmrc", ".inputrc", ".config/starship.toml", ".tmux.conf",
+                         ".vimrc", ".pythonrc.py", "unrelated.txt"):
+                (home / name).unlink()
+
     def test_issue4_homebrew_prefix_dependencies(self):
         # Scratch model of a user-owned Homebrew prefix: PATH holds symlinks
         # into Cellar/, and interpreters load libraries through opt/.

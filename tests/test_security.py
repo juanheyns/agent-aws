@@ -852,5 +852,55 @@ class Issue8AgentConfigTests(unittest.TestCase):
         self.assertNotIn(self.home / "notes.txt/sub", paths)
 
 
+class Issue9StartupCodeTests(unittest.TestCase):
+    """Shell and tool startup code (issue #9), scratch HOME only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name).resolve()
+        patcher = mock.patch.multiple(agent, HOME=self.home, AWS_DIR=self.home / ".aws",
+                                      AGENT_DIR=self.home / ".agent-aws")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    write = Issue6ResolverTests.write
+    assert_protected = Issue6ResolverTests.assert_protected
+
+    def test_issue9_startup_paths_and_tool_state_writable(self):
+        paths = {agent.HOME / path for path in agent.STARTUP_PATHS}
+        self.assert_protected(paths, ".config/fish/config.fish", ".config/fish/conf.d",
+                              ".config/fish/functions", ".config/fish/completions",
+                              ".oh-my-zsh/custom", ".zpreztorc", ".npmrc", ".inputrc",
+                              ".config/starship.toml", ".config/direnv", ".tmux.conf",
+                              ".config/tmux/tmux.conf", ".vimrc", ".config/nvim/init.lua",
+                              ".config/nvim/init.vim", ".ipython/profile_default/startup",
+                              ".ipython/profile_default/ipython_config.py")
+        for name in (".config", ".config/fish", ".config/fish/fish_variables", ".oh-my-zsh",
+                     ".oh-my-zsh/cache", ".zprezto", ".config/nvim", ".config/tmux", ".ipython"):
+            self.assertNotIn(self.home / name, paths, name)
+
+    def test_issue9_python_startup_file(self):
+        startup = self.write("dotfiles/pythonrc.py", "# fixture\n")
+        for value, expected in ((str(startup), True), ("relative.py", False), ("", False)):
+            with mock.patch.dict(agent.os.environ, {"PYTHONSTARTUP": value}):
+                self.assertEqual(startup in agent.protected_paths(), expected, value)
+
+    def test_issue9_linux_fish_skeleton_keeps_fish_variables_writable(self):
+        for name in (".config/fish/config.fish", ".config/fish/fish_variables",
+                     ".config/fish/conf.d/x.fish", ".config/other/settings",
+                     ".oh-my-zsh/custom/x.zsh", ".oh-my-zsh/oh-my-zsh.sh", ".npmrc"):
+            self.write(name, "# fixture\n")
+        (self.home / ".oh-my-zsh/cache").mkdir()
+        joined = " ".join(agent.build_sandbox_argv_linux(self.home / "creds"))
+        for name in (".config", ".config/fish", ".oh-my-zsh"):
+            self.assertIn(f"--tmpfs {self.home}/{name} ", joined, name)
+        for name in (".config/fish/config.fish", ".config/fish/conf.d", ".oh-my-zsh/custom", ".npmrc"):
+            self.assertIn(f"--ro-bind {self.home}/{name} {self.home}/{name}", joined, name)
+        for name in (".config/fish/fish_variables", ".config/other", ".oh-my-zsh/oh-my-zsh.sh",
+                     ".oh-my-zsh/cache"):
+            self.assertIn(f"--bind {self.home}/{name} {self.home}/{name}", joined, name)
+
+
 if __name__ == "__main__":
     unittest.main()

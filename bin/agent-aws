@@ -65,6 +65,16 @@ STARTUP_PATHS = (
     # ~/.codex/config.toml, auth.json, sessions) stay writable.
     ".claude/CLAUDE.md", ".claude/agents", ".claude/commands", ".claude/skills",
     ".codex/AGENTS.md", ".codex/AGENTS.override.md",
+    # Shell and tool startup code that later unsandboxed shells and tools run
+    # (#9). Only files that the tools do not write in normal use: fish
+    # fish_variables (`set -U`), the oh-my-zsh checkout and cache, nvim
+    # lazy-lock.json and IPython history stay writable.
+    ".config/fish/config.fish", ".config/fish/conf.d", ".config/fish/functions",
+    ".config/fish/completions", ".oh-my-zsh/custom", ".zpreztorc", ".inputrc",
+    ".npmrc", ".config/starship.toml", ".config/direnv",
+    ".tmux.conf", ".config/tmux/tmux.conf",
+    ".vimrc", ".config/nvim/init.lua", ".config/nvim/init.vim",
+    ".ipython/profile_default/startup", ".ipython/profile_default/ipython_config.py",
 )
 # Linux: HOME-relative directories that are bound read-write instead of made
 # a private skeleton, with their existing protected children bound read-only
@@ -885,6 +895,10 @@ def protected_paths(targets=None):
                 paths.add(prefix if prefix != HOME else path.resolve().parent)
     paths.update((Path(sys.prefix), Path(sys.base_prefix)))
     paths.update(config_targets() if targets is None else targets)
+    # The file that $PYTHONSTARTUP names runs in every interactive Python (#9).
+    startup = os.environ.get("PYTHONSTARTUP", "")
+    if os.path.isabs(startup):
+        paths.update(usable_targets({Path(startup)}))
     aws = shutil.which("aws", path=executable_path())
     python = aws and script_python(Path(aws).resolve())
     if python:
