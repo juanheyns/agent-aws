@@ -397,11 +397,28 @@ sys.exit(0 if rc == 0 else 1)
                             + ["echo 'curl evil' > ~/.claude/agents/new.md",
                                "echo 'curl evil' > ~/.claude/hooks/check.sh"], label="ISSUE8")
             # Missing instruction files and directories cannot be planted.
-            for name in (".claude/CLAUDE.md", ".claude/skills/x/SKILL.md", ".codex/AGENTS.override.md"):
+            # On Linux ~/.codex is bound read-write (LINUX_PARENT_BIND), so a
+            # missing ~/.codex/AGENTS.override.md can be created (documented).
+            missing = [".claude/CLAUDE.md", ".claude/skills/x/SKILL.md"]
+            if sys.platform == "darwin":
+                missing.append(".codex/AGENTS.override.md")
+            for name in missing:
                 self.not_persisted(f'mkdir -p "$(dirname "$HOME/{name}")" && '
                                    f'echo "run evil" > "$HOME/{name}"', home / name.split("/x/")[0])
                 print(f"ISSUE8 NOT PERSISTED {name}", flush=True)
+            # Rename over an existing instruction file fails on both platforms.
+            result = self.run_shell("echo 'run evil' > ~/.codex/.evil && mv -f ~/.codex/.evil ~/.codex/AGENTS.md")
+            print(f"ISSUE8 RENAME OVER AGENTS.md exit={result.returncode} [{result.stderr.strip()}]", flush=True)
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            (home / ".codex/.evil").unlink(missing_ok=True)
             self.assert_unchanged(protected)
+            # A write that replaces ~/.codex/config.toml by rename (temp file
+            # plus mv, as an agent saving its config) persists on the host.
+            result = self.run_shell("printf 'model = \"renamed\"\\n' > ~/.codex/.config.toml.tmp && "
+                                    "mv ~/.codex/.config.toml.tmp ~/.codex/config.toml")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("renamed", (home / ".codex/config.toml").read_text())
+            print("ISSUE8 RENAME REPLACE ~/.codex/config.toml PERSISTED", flush=True)
             # Positive controls: the agents' own config and state stay writable.
             result = self.run_shell(" && ".join(
                 ["echo '{\"mcpServers\": {}}' >> ~/.claude.json",

@@ -314,14 +314,17 @@ stay writable**: `~/.claude.json`, `~/.codex/config.toml`, `~/.codex/auth.json`,
 `~/.claude/plugins`, session state and history. agent-aws protects:
 
 - The instruction files and directories in the [protected list](#protected-write-denied-on-macos-read-only-or-private-on-linux).
-  A missing one cannot be created in a run.
+  A missing one cannot be created in a run, except on Linux for
+  `~/.codex/AGENTS.md` and `~/.codex/AGENTS.override.md` (see
+  [what normal use now breaks](#what-normal-use-now-breaks-inside-a-run)).
 - The programs that this config names, read before the sandbox starts and
   outside it. Nothing is executed. HOME and its ancestors are never protected.
     - `~/.claude/settings.json` and `settings.local.json`: every hook
       `command`, `statusLine.command`, `apiKeyHelper`, `awsAuthRefresh`,
       `awsCredentialExport` and `otelHeadersHelper`. These are shell commands:
       the first word is used when it is an absolute or `~` path (a leading
-      `exec` is skipped, and a leading `$HOME/` or `${HOME}/` counts as `~/`).
+      `exec` is skipped, and a leading `$HOME/`, `${HOME}/`, `"$HOME"/` or
+      `"${HOME}"/` counts as `~/`).
     - `~/.claude.json`: `mcpServers.*.command`, at the top level and in
       `projects.*.mcpServers`.
     - `~/.codex/config.toml`: `mcp_servers.*.command` and `notify[0]`. This
@@ -332,9 +335,15 @@ stay writable**: `~/.claude.json`, `~/.codex/config.toml`, `~/.codex/auth.json`,
   continues and prints a warning. The programs of that file are then not
   protected.
 
-**Not protected.** The config files themselves, so a run can add a new MCP
-server or `notify` program to `~/.claude.json` or `~/.codex/config.toml`, and
-it is started by the next unsandboxed session. `~/.claude/plugins/**` stays
+**Not protected.** The config files themselves: `~/.claude.json` and
+`~/.codex/config.toml` stay writable, so a run can add a new `mcpServers` or
+`notify` entry that points to any program, and the next unsandboxed session
+starts it. Protecting the named programs only stops changes to programs that
+the config already names (and on Linux it adds skeletons, see below).
+`@path` imports in `~/.claude/CLAUDE.md` (for example
+`@~/notes/agent-rules.md`): later sessions load the imported files as
+instructions, but agent-aws does not read the imports, so these files stay
+writable. `~/.claude/plugins/**` stays
 writable: Claude Code writes it to install and update plugins, and plugin
 hooks, MCP servers and commands live in the same trees, so no read-only
 subset is safe without a test with the real agent. Also not protected: a
@@ -371,9 +380,9 @@ reads only `~/.claude` and `~/.codex`), and other agents (not surveyed).
   read-only, and the project directory and its parents below HOME become
   skeletons.
 - At run start on Linux, agent-aws prints the skeleton directories that come
-  from git and SSH targets (`agent-aws: Linux: new top-level entries in these
-  directories are lost when the run ends (they hold protected git/ssh
-  targets): …`). Create new projects outside these directories, or move the
+  from git, SSH and agent config targets (`agent-aws: Linux: new top-level
+  entries in these directories are lost when the run ends (they hold protected
+  git/ssh/agent config targets): …`). Create new projects outside these directories, or move the
   target out of the project tree.
 - Why every directory between HOME and the target: a read-only bind of only
   the target, in a read-write parent, is not sufficient. Linux refuses to
@@ -394,15 +403,27 @@ reads only `~/.claude` and `~/.codex`), and other agents (not surveyed).
   `.claude/agents`) and `~/.claude/projects/*/memory` stay writable.
 - You cannot edit a hook script, status line script or MCP server program
   that the user-level config names by an absolute or `~` path. Other files
-  next to it stay writable. On Linux the directory that holds it becomes a
-  private skeleton: new top-level entries there disappear when the run ends.
+  next to it stay writable. **On Linux, every directory between HOME and the
+  program becomes a private skeleton**, as for a git target above. For
+  example, an MCP server `command` of `~/.nvm/versions/node/v22/bin/npx` makes
+  `~/.nvm`, `~/.nvm/versions`, `~/.nvm/versions/node`,
+  `~/.nvm/versions/node/v22` and `~/.nvm/versions/node/v22/bin` skeletons, so
+  new top-level entries that `nvm install` or `npm i -g` write in a run (a new
+  Node version, a new global package link) are lost when the run ends. The
+  reason is the "Why every directory between HOME and the target" item above.
 - On macOS, a missing `~/.codex` cannot be created in a run (as for
   `~/.claude`): run `codex` once outside the sandbox first. On Linux,
-  `~/.codex` is a private skeleton: existing `config.toml`, `auth.json`,
-  `sessions` and `log` stay writable, but a new top-level entry in it (for
-  example a first `history.jsonl`) disappears when the run ends, and a write
-  that replaces an existing file there by rename can fail. This was not tested
-  with the real Codex ([#8](https://github.com/juanheyns/agent-aws/issues/8)).
+  `~/.codex` is not a skeleton (`LINUX_PARENT_BIND` in `bin/agent-aws`): it is
+  bound read-write, and only its existing `AGENTS.md` and `AGENTS.override.md`
+  are bound read-only on top. So Codex can replace `config.toml` by rename and
+  create new files there. This is safe against the rename attack because
+  `~/.codex` and each existing instruction file are mount points (`EBUSY`).
+  The cost: on Linux, a missing `~/.codex/AGENTS.md` or
+  `~/.codex/AGENTS.override.md` can be created in a run and stays on the host
+  (macOS denies it). If a config target is below `~/.codex` (for example a
+  `notify` program in `~/.codex/bin`), `~/.codex` stays a skeleton, so a
+  missing program there cannot be created. This was not tested with the real
+  Codex ([#8](https://github.com/juanheyns/agent-aws/issues/8)).
 
 ### Not protected
 
@@ -414,7 +435,7 @@ with disposable fixtures that a run can still write these. Each one is tracked:
 | Install targets of symlinked PATH executables | `~/.local/share/claude/versions/*` behind `~/.local/bin/claude` | [#13](https://github.com/juanheyns/agent-aws/issues/13) |
 | Git/SSH commands that are shell strings, and config that agent-aws does not parse | `!sh -c '…'` aliases, `ProxyCommand sh -c …`, a relative `core.hooksPath`, system git config, `/etc/ssh/ssh_config`, ssh `${VAR}` paths | [#6](https://github.com/juanheyns/agent-aws/issues/6) (decision: not resolvable in general; see [git and SSH config targets](#git-and-ssh-config-targets)) |
 | Repository-local configuration | `.git/config` (`core.fsmonitor`), `.git/hooks`, project `.claude/settings.json`, `.envrc` | [#7](https://github.com/juanheyns/agent-aws/issues/7) |
-| Agent config that the agent writes itself | `~/.claude.json` itself (a new `mcpServers` entry), `~/.claude/plugins/**`, `~/.codex/config.toml` itself (a new `mcp_servers` or `notify`), interpreter-prefixed hook commands, other agents (not surveyed); project config is [#7](https://github.com/juanheyns/agent-aws/issues/7) | [#8](https://github.com/juanheyns/agent-aws/issues/8) (needs a test with the real agents; see [agent instructions and config programs](#agent-instructions-and-config-programs)) |
+| Agent config that the agent writes itself | `~/.claude.json` itself (a new `mcpServers` entry), `~/.claude/plugins/**`, `~/.codex/config.toml` itself (a new `mcp_servers` or `notify`), files that `~/.claude/CLAUDE.md` imports with `@path`, interpreter-prefixed hook commands, other agents (not surveyed); project config is [#7](https://github.com/juanheyns/agent-aws/issues/7) | [#8](https://github.com/juanheyns/agent-aws/issues/8) (needs a test with the real agents; see [agent instructions and config programs](#agent-instructions-and-config-programs)) |
 | Code sourced by startup files, other shells, tool config, other bin dirs | `~/.oh-my-zsh/custom`, `~/.config/fish`, `~/.npmrc`, `~/bin` not in PATH | [#9](https://github.com/juanheyns/agent-aws/issues/9) |
 | Mutable dependencies outside protected trees | Homebrew `var/`, new prefix entries, nvm, uv, conda, mise | [#10](https://github.com/juanheyns/agent-aws/issues/10) |
 | macOS services that write for the caller, app autostart | cfprefsd (Terminal/iTerm2 startup command), Login Items, launchd jobs, iTerm2 AutoLaunch | [#11](https://github.com/juanheyns/agent-aws/issues/11) |

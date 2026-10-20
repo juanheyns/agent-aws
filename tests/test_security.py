@@ -665,7 +665,7 @@ class Issue6ResolverTests(unittest.TestCase):
         self.assertIn(f"--bind {home}/Source/github.com/other {home}/Source/github.com/other", argv)
         note = error.getvalue()
         self.assertIn("agent-aws: Linux: new top-level entries in these directories are lost "
-                      "when the run ends (they hold protected git/ssh targets): ", note)
+                      "when the run ends (they hold protected git/ssh/agent config targets): ", note)
         self.assertIn("~/Source, ~/Source/github.com, ~/Source/github.com/me, "
                       "~/Source/github.com/me/dotfiles, ~/work\n", note)
         # Skeletons that STARTUP_PATHS make anyway, and read-only
@@ -781,6 +781,48 @@ class Issue8AgentConfigTests(unittest.TestCase):
             paths, error = self.resolve()
         self.assertIn("tomllib", error)
         self.assertEqual(paths, {self.home / "ok-hook"})
+
+    def test_issue8_quoted_home_hook_commands(self):
+        # Review round 1, finding 2: a quoted "$HOME" followed by the path.
+        forms = ('"$HOME"/.claude/hooks/a.sh', '"$HOME/.claude/hooks/b.sh"',
+                 "$HOME/.claude/hooks/c.sh --x", "${HOME}/.claude/hooks/f.sh",
+                 '"${HOME}"/.claude/hooks/g.sh arg')
+        self.write(".claude/settings.json", json.dumps({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": command} for command in forms]}]}}))
+        paths, error = self.resolve()
+        self.assertEqual(error, "")
+        self.assertEqual(paths, {self.home / f".claude/hooks/{name}.sh" for name in "abcfg"})
+
+    def linux_argv(self, targets=frozenset()):
+        with mock.patch.multiple(agent, AWS_DIR=self.home / ".aws",
+                                 AGENT_DIR=self.home / ".agent-aws"):
+            protected = agent.protected_paths(set(targets))
+            return agent.linux_home_mounts(protected), protected
+
+    def test_issue8_linux_codex_parent_bind(self):
+        # Review round 1, finding 4: ~/.codex is bound read-write on Linux
+        # (config.toml can be replaced by rename); only the existing
+        # instruction files below it are read-only mounts.
+        self.write(".codex/AGENTS.md", "# fixture\n")
+        self.write(".codex/config.toml", 'model = "fixture"\n')
+        home = self.home
+        argv, _ = self.linux_argv()
+        text = " ".join(argv) + " "
+        codex = f"{home}/.codex"
+        self.assertIn(f"--bind {codex} {codex} ", text)
+        self.assertIn(f"--ro-bind {codex}/AGENTS.md {codex}/AGENTS.md ", text)
+        self.assertNotIn(f"--tmpfs {codex} ", text)
+        self.assertNotIn("AGENTS.override.md", text)
+        self.assertNotIn(f"{codex}/config.toml", text)
+        # The parent bind comes before the read-only child.
+        self.assertLess(text.index(f"--bind {codex} "), text.index(f"--ro-bind {codex}/AGENTS.md"))
+        # A config target below ~/.codex keeps the skeleton: a missing
+        # program there must not be creatable.
+        argv, protected = self.linux_argv({home / ".codex/hooks/notify.sh"})
+        text = " ".join(argv) + " "
+        self.assertIn(f"--tmpfs {codex} ", text)
+        self.assertNotIn(f"--bind {codex} {codex} ", text)
+        self.assertNotIn(home / ".codex", agent.linux_parent_binds(protected))
 
     def test_issue8_home_and_ancestors_never_protected(self):
         self.write("notes.txt", "not a directory\n")
