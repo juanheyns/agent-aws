@@ -26,7 +26,10 @@ class SandboxTests(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(prefix="sandbox-check-", dir="/tmp")
         cls.home = Path(cls.tmp.name).resolve()
-        cls.env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
+        # GIT_* and XDG_CONFIG_HOME of the developer would point the git
+        # config resolver (issue #6) outside the scratch HOME.
+        cls.env = {k: v for k, v in os.environ.items()
+                   if not k.startswith(("PYTHON", "GIT_")) and k != "XDG_CONFIG_HOME"}
         cls.env["HOME"] = str(cls.home)
         for relative in (".aws/sso/cache", ".agent-aws", "Library/LaunchAgents", ".config/brnr", "bin", "project", ".local/bin"):
             (cls.home / relative).mkdir(parents=True)
@@ -229,6 +232,117 @@ sys.exit(0 if rc == 0 else 1)
             (self.home / ".gitconfig").unlink()
             shutil.rmtree(self.home / ".ssh")
             shutil.rmtree(self.home / ".claude")
+
+    def write_fixtures(self, files):
+        for name, text in files.items():
+            (self.home / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.home / name).write_text(text)
+
+    def denied_all(self, commands):
+        # Run every attack first, so a failure reports all writable paths.
+        results = {command: self.run_shell(command) for command in commands}
+        for command, result in results.items():
+            state = "DENIED" if result.returncode else "WRITABLE"
+            print(f"ISSUE6 {state} exit={result.returncode} {command} "
+                  f"[{result.stderr.strip()}]", flush=True)
+        writable = [command for command, result in results.items() if not result.returncode]
+        self.assertEqual(writable, [], "writable from a run")
+        for command, result in results.items():
+            self.assertRegex(result.stderr.lower(),
+                             "not permitted|permission denied|read-only file system", command)
+
+    def assert_unchanged(self, files):
+        for name, text in files.items():
+            self.assertEqual((self.home / name).read_text(), text, name)
+
+    def test_issue6_git_include_targets_hooks_path_and_helpers(self):
+        # Issue #6: ~/.gitconfig is protected (#5), but the files and programs
+        # it refers to were writable. The includeIf condition does not match
+        # the run's cwd, so git alone would not list that target.
+        home = self.home
+        gitconfig = ("[include]\n\tpath = ~/dotfiles/git-extra\n"
+                     '[includeIf "gitdir:~/work/"]\n\tpath = dotfiles/work-extra\n'
+                     "[core]\n\thooksPath = ~/.githooks\n"
+                     f"[credential]\n\thelper = {home}/tools/git-cred --fixture\n")
+        protected = {
+            ".gitconfig": gitconfig,
+            "dotfiles/git-extra": "[user]\n\tname = Included User\n[include]\n\tpath = nested-extra\n",
+            "dotfiles/nested-extra": "[core]\n\tfsmonitor = ~/tools/git-fsmonitor\n",
+            ".githooks/pre-commit": "#!/bin/sh\nexit 0\n",
+            "tools/git-cred": "#!/bin/sh\nexit 0\n",
+            "tools/git-fsmonitor": "#!/bin/sh\nexit 0\n",
+        }
+        writable = {"dotfiles/unrelated": "# sentinel\n", "tools/unrelated": "# sentinel\n",
+                    ".ssh/known_hosts": "# sentinel\n"}
+        self.write_fixtures({**protected, **writable})
+        try:
+            self.denied_all((
+                "echo '[core]fsmonitor=/tmp/evil' >> ~/dotfiles/git-extra",
+                "echo '[core]fsmonitor=/tmp/evil' >> ~/dotfiles/nested-extra",
+                "echo 'curl evil' >> ~/.githooks/pre-commit",
+                "echo 'curl evil' > ~/.githooks/post-checkout",
+                "echo 'curl evil' >> ~/tools/git-cred",
+                "echo 'curl evil' >> ~/tools/git-fsmonitor",
+            ))
+            self.not_persisted("echo '[core]fsmonitor=/tmp/evil' > ~/dotfiles/work-extra",
+                               home / "dotfiles/work-extra")
+            self.assertFalse((home / ".githooks/post-checkout").exists())
+            self.assert_unchanged(protected)
+            # Positive controls: git still reads the included config, and
+            # files that the git config does not refer to stay writable.
+            result = self.run_shell("git config --global --get user.name && "
+                                    "echo ok >> ~/dotfiles/unrelated && "
+                                    "echo ok >> ~/tools/unrelated && "
+                                    "echo 'host ssh-ed25519 AAAA' >> ~/.ssh/known_hosts")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Included User", result.stdout)
+            for name in writable:
+                self.assertIn("ok" if "unrelated" in name else "host ssh-ed25519",
+                              (home / name).read_text(), name)
+            print(f"ISSUE6 GIT CONTROL: {result.stdout.strip()}", flush=True)
+        finally:
+            (home / ".gitconfig").unlink()
+            for name in ("dotfiles", ".githooks", "tools", ".ssh"):
+                shutil.rmtree(home / name)
+
+    def test_issue6_ssh_include_targets_and_commands(self):
+        # Issue #6: ssh `Include` targets and the programs that ssh runs
+        # (ProxyCommand, Match exec, KnownHostsCommand) outside ~/.ssh/config.
+        home = self.home
+        protected = {
+            ".ssh/config": ("Include config.d/*\nInclude ~/ssh-extra/hosts\n"
+                            "Host jump\n  ProxyCommand ~/tools/ssh-proxy %h %p\n"
+                            'Match exec "~/tools/ssh-match %h"\n  User fixture\n'),
+            ".ssh/config.d/work": f"Host work\n  KnownHostsCommand={home}/tools/ssh-known %H\n",
+            "ssh-extra/hosts": "Host extra\n  User fixture\n",
+            "tools/ssh-proxy": "#!/bin/sh\nexit 0\n",
+            "tools/ssh-match": "#!/bin/sh\nexit 0\n",
+            "tools/ssh-known": "#!/bin/sh\nexit 0\n",
+        }
+        writable = {"ssh-extra/unrelated": "# sentinel\n", "tools/unrelated": "# sentinel\n",
+                    ".ssh/known_hosts": "# sentinel\n"}
+        self.write_fixtures({**protected, **writable})
+        try:
+            self.denied_all((
+                "echo 'ProxyCommand /tmp/evil' >> ~/.ssh/config.d/work",
+                "echo 'ProxyCommand /tmp/evil' > ~/.ssh/config.d/zz-new",
+                "echo 'ProxyCommand /tmp/evil' >> ~/ssh-extra/hosts",
+                "echo 'curl evil' >> ~/tools/ssh-proxy",
+                "echo 'curl evil' >> ~/tools/ssh-match",
+                "echo 'curl evil' >> ~/tools/ssh-known",
+            ))
+            self.assertFalse((home / ".ssh/config.d/zz-new").exists())
+            self.assert_unchanged(protected)
+            result = self.run_shell("echo ok >> ~/ssh-extra/unrelated && "
+                                    "echo ok >> ~/tools/unrelated && "
+                                    "echo 'host ssh-ed25519 AAAA' >> ~/.ssh/known_hosts")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for name in writable:
+                self.assertIn("ok" if "unrelated" in name else "host ssh-ed25519",
+                              (home / name).read_text(), name)
+        finally:
+            for name in ("ssh-extra", "tools", ".ssh"):
+                shutil.rmtree(home / name)
 
     def test_issue4_homebrew_prefix_dependencies(self):
         # Scratch model of a user-owned Homebrew prefix: PATH holds symlinks

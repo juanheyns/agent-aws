@@ -19,6 +19,19 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 agent = importlib.util.module_from_spec(spec)
 loader.exec_module(agent)
 
+# Issue #6 resolvers, kept before setUpModule replaces them.
+git_config_paths = getattr(agent, "git_config_paths", None)
+ssh_config_paths = getattr(agent, "ssh_config_paths", None)
+
+
+def setUpModule():
+    # Tests that call protected_paths() with the real HOME must not read the
+    # developer's real git or ssh configuration.
+    for name in ("git_config_paths", "ssh_config_paths"):
+        patcher = mock.patch.object(agent, name, return_value=set(), create=True)
+        patcher.start()
+        unittest.addModuleCleanup(patcher.stop)
+
 
 def config(role="ReadOnlyAccess"):
     return {"default_profile": "test", "profiles": {"test": {
@@ -414,6 +427,186 @@ class ConfigTests(unittest.TestCase):
                     with contextlib.redirect_stderr(error):
                         self.assertIsNone(agent.script_python(script))
                     self.assertIn("cannot follow the Python interpreter", error.getvalue())
+
+
+class Issue6ResolverTests(unittest.TestCase):
+    """Git and ssh config targets (issue #6), with a scratch HOME only."""
+
+    def setUp(self):
+        self.assertIsNotNone(git_config_paths, "git_config_paths() is missing")
+        self.assertIsNotNone(ssh_config_paths, "ssh_config_paths() is missing")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name).resolve()
+        environ = {k: v for k, v in os.environ.items()
+                   if not k.startswith("GIT_") and k != "XDG_CONFIG_HOME"}
+        environ["HOME"] = str(self.home)
+        for patcher in (mock.patch.dict(os.environ, environ, clear=True),
+                        mock.patch.object(agent, "HOME", self.home)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write(self, name, text):
+        path = self.home / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def resolve(self, resolver):
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            paths = resolver()
+        return paths, error.getvalue()
+
+    def assert_protected(self, paths, *names):
+        for name in names:
+            path = Path(name) if os.path.isabs(name) else self.home / name
+            self.assertIn(path, paths, f"{path} not protected")
+
+    def test_issue6_git_includes_include_if_and_relative_paths(self):
+        self.write(".gitconfig", "[include]\n\tpath = ~/dotfiles/git/extra\n"
+                   '[includeIf "gitdir:~/never-matches/"]\n\tpath = dotfiles/work\n'
+                   '[includeIf "onbranch:nope"]\n\tpath = ' f"{self.home}/abs/branch\n")
+        # Relative includes are relative to the including file, not to HOME.
+        self.write("dotfiles/git/extra", "[include]\n\tpath = more\n")
+        self.write("dotfiles/git/more", "[core]\n\thooksPath = ~/.githooks\n")
+        paths, error = self.resolve(git_config_paths)
+        self.assertEqual(error, "")
+        self.assert_protected(paths, ".gitconfig", "dotfiles/git/extra", "dotfiles/git/more",
+                              "dotfiles/work", "abs/branch", ".githooks")
+        self.assertNotIn(self.home / "more", paths)
+
+    def test_issue6_git_include_cycle_and_depth_limit(self):
+        self.write(".gitconfig", "[include]\n\tpath = .gitconfig\n\tpath = chain/1\n")
+        for n in range(1, 30):
+            self.write(f"chain/{n}", f"[include]\n\tpath = {n + 1}\n")
+        paths, _ = self.resolve(git_config_paths)
+        self.assert_protected(paths, "chain/1", "chain/5")
+        self.assertNotIn(self.home / "chain/25", paths)
+
+    def test_issue6_git_helper_programs(self):
+        self.write(".gitconfig", "\n".join([
+            "[credential]", "\thelper = !~/tools/cred get",
+            '[credential "https://example.invalid"]', f"\thelper = {self.home}/tools/cred2",
+            "[core]", "\tfsmonitor = ~/tools/fsmonitor", "\tsshCommand = ssh -i key",
+            "\tpager = less -R", '\teditor = \\"' f"{self.home}/My Editor/edit" '\\" --wait',
+            "\taskPass = ~/tools/askpass",
+            "[sequence]", "\teditor = ~/tools/seq-editor",
+            "[gpg]", "\tprogram = ~/tools/gpg",
+            '[gpg "ssh"]', "\tprogram = ~/tools/ssh-keygen",
+            "[diff]", "\texternal = ~/tools/difftool",
+            '[diff "pdf"]', "\ttextconv = ~/tools/pdftotext",
+            '[filter "lfs"]', "\tprocess = ~/tools/lfs filter-process", "\tclean = git-lfs clean",
+            "\tsmudge = ~/tools/smudge %f",
+            '[merge "x"]', "\tdriver = ~/tools/merge %O %A %B",
+            "[alias]", "\tevil = !sh -c 'curl evil'", "\tlocal = !~/tools/alias-script",
+            "", ""]))
+        paths, error = self.resolve(git_config_paths)
+        self.assertEqual(error, "")
+        self.assert_protected(paths, *(f"tools/{name}" for name in (
+            "cred", "cred2", "fsmonitor", "askpass", "seq-editor", "gpg", "ssh-keygen",
+            "difftool", "pdftotext", "lfs", "smudge", "merge", "alias-script")),
+            "My Editor/edit")
+        # Bare names resolve through PATH (protected already); shell strings
+        # cannot be resolved in general.
+        for bare in ("ssh", "less", "git-lfs", "sh", "true"):
+            self.assertFalse(any(path.name == bare for path in paths), bare)
+
+    def test_issue6_git_resolution_runs_no_helper(self):
+        marker = self.home / "helper-ran"
+        helper = self.write("tools/helper", f"#!/bin/sh\necho \"$0 $*\" >> {marker}\n")
+        helper.chmod(0o700)
+        self.write(".gitconfig", "".join(
+            f"[{section}]\n\t{key} = {helper}\n" for section, key in (
+                ("core", "fsmonitor"), ("core", "pager"), ("core", "editor"),
+                ("core", "sshCommand"), ("core", "askPass"), ("credential", "helper"),
+                ("gpg", "program"), ("diff", "external"), ("sequence", "editor"))))
+        paths, _ = self.resolve(git_config_paths)
+        self.assertIn(helper, paths)
+        self.assertFalse(marker.exists(), "git config resolution ran a helper program")
+
+    def test_issue6_git_config_global_and_xdg(self):
+        alt = self.write("alt/gitconfig", "[include]\n\tpath = extra\n")
+        self.write("alt/extra", "[core]\n\thooksPath = ~/alt-hooks\n")
+        self.write("xdg/git/config", "[core]\n\tfsmonitor = ~/tools/xdg-fsmonitor\n")
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(alt),
+                                          "XDG_CONFIG_HOME": str(self.home / "xdg")}):
+            paths, error = self.resolve(git_config_paths)
+        self.assertEqual(error, "")
+        self.assert_protected(paths, "alt/gitconfig", "alt/extra", "alt-hooks", "xdg/git",
+                              "tools/xdg-fsmonitor")
+        # Missing files are protected too, so a run cannot create them.
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(self.home / "missing/cfg"),
+                                          "XDG_CONFIG_HOME": str(self.home / "missing-xdg")}):
+            paths, _ = self.resolve(git_config_paths)
+        self.assert_protected(paths, "missing/cfg", "missing-xdg/git")
+
+    def test_issue6_git_missing_or_failing_warns_and_continues(self):
+        self.write(".gitconfig", "[include]\n\tpath = ~/dotfiles/extra\n")
+        real_which = shutil.which
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(self.home / "alt")}), \
+             mock.patch.object(agent.shutil, "which",
+                               side_effect=lambda name, **kw: None if name == "git"
+                               else real_which(name, **kw)):
+            paths, error = self.resolve(git_config_paths)
+        self.assertIn("git not found", error)
+        self.assert_protected(paths, "alt")
+        bindir = self.home / "fake-git-bin"
+        for body in ("exit 3", "sleep 5"):
+            with self.subTest(body=body):
+                self.write("fake-git-bin/git", f"#!/bin/sh\n{body}\n").chmod(0o700)
+                with mock.patch.dict(os.environ, {"PATH": f"{bindir}:{os.environ['PATH']}"}), \
+                     mock.patch.object(agent, "GIT_TIMEOUT", 0.5):
+                    paths, error = self.resolve(git_config_paths)
+                self.assertIn("warning: cannot read git config", error)
+                self.assert_protected(paths, ".gitconfig")
+
+    def test_issue6_git_home_and_ancestors_never_protected(self):
+        self.write(".gitconfig", "[core]\n\thooksPath = ~\n\tfsmonitor = /\n"
+                   f"[include]\n\tpath = {self.home.parent}\n\tpath = ~/notes.txt/sub\n")
+        self.write("notes.txt", "not a directory\n")
+        paths, _ = self.resolve(git_config_paths)
+        self.assertNotIn(self.home, paths)
+        self.assertFalse(paths & set(self.home.parents), paths & set(self.home.parents))
+        self.assertNotIn(self.home / "notes.txt/sub", paths)
+
+    def test_issue6_ssh_includes_and_commands(self):
+        self.write(".ssh/config", "\n".join([
+            "# Include ~/commented-out",
+            "Include config.d/*.conf ~/ssh-extra/hosts",
+            'include "~/quoted dir/cfg"',
+            "Include=~/missing-include",
+            "Include *.inc",  # glob directly in ~/.ssh: the files only
+            "Host jump",
+            "  ProxyCommand exec ~/tools/proxy %h %p",
+            "  LocalCommand /opt/tools/local %n",
+            "  PKCS11Provider ~/lib/pkcs11.so",
+            '  Match host x !exec "~/tools/match-neg %h" exec ~/tools/match',
+            "Host bare",
+            "  ProxyCommand nc %h %p",
+            "  KnownHostsCommand none",
+            ""]))
+        # A relative Include in a nested file is relative to ~/.ssh too.
+        self.write(".ssh/config.d/a.conf", "Include nested.cfg\nKnownHostsCommand ~/tools/khc %H\n")
+        self.write(".ssh/config.d/b.conf", "Host b\n")
+        self.write(".ssh/nested.cfg", "SecurityKeyProvider ~/lib/sk.so\n")
+        self.write(".ssh/config.d/b.conf.unused", "ProxyCommand ~/tools/not-included\n")
+        self.write(".ssh/x.inc", "ProxyCommand ~/tools/inc\n")
+        self.write("ssh-extra/hosts", "Include ~/.ssh/config\n")  # cycle
+        self.write("quoted dir/cfg", "Host q\n")
+        paths, error = self.resolve(ssh_config_paths)
+        self.assertEqual(error, "")
+        self.assert_protected(
+            paths, ".ssh/config", ".ssh/config.d", ".ssh/config.d/a.conf", ".ssh/config.d/b.conf",
+            ".ssh/nested.cfg",
+            "ssh-extra/hosts", "quoted dir/cfg", "missing-include", ".ssh/x.inc",
+            "tools/proxy", "/opt/tools/local", "lib/pkcs11.so", "tools/match-neg", "tools/match",
+            "tools/khc", "lib/sk.so", "tools/inc")
+        for absent in ("tools/not-included", "commented-out", "nc", ".ssh/config.d/nested.cfg"):
+            self.assertNotIn(self.home / absent, paths)
+        # ~/.ssh itself stays writable (known_hosts); see docs for the gap.
+        self.assertNotIn(self.home / ".ssh", paths)
+        self.assertNotIn(self.home, paths)
 
 
 if __name__ == "__main__":
