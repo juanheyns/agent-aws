@@ -4,6 +4,7 @@ No login or AWS request is made. Run on macOS with:
     python3 -m unittest discover -s tests -p test_sandbox.py -v
 On Linux the same fixture exercises bwrap when it is installed.
 """
+import importlib.util
 import json
 import os
 import shlex
@@ -17,6 +18,7 @@ from pathlib import Path
 
 from test_security import ROOT, config
 
+HAS_TOMLLIB = importlib.util.find_spec("tomllib") is not None
 SUPPORTED = sys.platform == "darwin" or (sys.platform.startswith("linux") and shutil.which("bwrap"))
 
 
@@ -238,12 +240,12 @@ sys.exit(0 if rc == 0 else 1)
             (self.home / name).parent.mkdir(parents=True, exist_ok=True)
             (self.home / name).write_text(text)
 
-    def denied_all(self, commands):
+    def denied_all(self, commands, label="ISSUE6"):
         # Run every attack first, so a failure reports all writable paths.
         results = {command: self.run_shell(command) for command in commands}
         for command, result in results.items():
             state = "DENIED" if result.returncode else "WRITABLE"
-            print(f"ISSUE6 {state} exit={result.returncode} {command} "
+            print(f"{label} {state} exit={result.returncode} {command} "
                   f"[{result.stderr.strip()}]", flush=True)
         writable = [command for command, result in results.items() if not result.returncode]
         self.assertEqual(writable, [], "writable from a run")
@@ -355,6 +357,73 @@ sys.exit(0 if rc == 0 else 1)
                               (home / name).read_text(), name)
         finally:
             for name in ("ssh-extra", "tools", ".ssh"):
+                shutil.rmtree(home / name)
+
+    def test_issue8_agent_instructions_and_config_programs(self):
+        # Issue #8: user-level agent instructions, and the programs that agent
+        # config names (hooks, MCP servers, Codex notify), were writable. The
+        # config files themselves stay writable: the agents write them.
+        home = self.home
+        settings = json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "~/.claude/hooks/check.sh --fixture"}]}]}})
+        claude_json = json.dumps({
+            "mcpServers": {"fixture": {"command": f"{home}/tools/mcp-server", "args": []}},
+            "projects": {str(home / "project"): {"mcpServers": {"p": {"command": "~/tools/project-mcp"}}}}})
+        codex_toml = ('notify = ["~/tools/codex-notify", "--fixture"]\n'
+                      '[mcp_servers.fixture]\ncommand = "~/tools/codex-mcp"\n')
+        script = "#!/bin/sh\nexit 0\n"
+        protected = {
+            ".claude/settings.json": settings,
+            ".claude/agents/reviewer.md": "# fixture\n",
+            ".claude/commands/deploy.md": "# fixture\n",
+            ".codex/AGENTS.md": "# fixture\n",
+            ".claude/hooks/check.sh": script,
+            "tools/mcp-server": script,
+            "tools/project-mcp": script,
+        }
+        # Codex config is TOML: protected only where tomllib exists (3.11+).
+        codex_programs = {"tools/codex-mcp": script, "tools/codex-notify": script}
+        if HAS_TOMLLIB:
+            protected.update(codex_programs)
+        writable = {".claude.json": claude_json, ".codex/config.toml": codex_toml,
+                    ".codex/auth.json": '{"token": "FAKE-NOT-A-TOKEN"}\n',
+                    ".claude/projects/old.jsonl": "{}\n", ".codex/sessions/old": "{}\n",
+                    ".claude/plugins/installed_plugins.json": "{}\n",
+                    "tools/unrelated": "# sentinel\n", ".claude/hooks/unrelated.sh": "# sentinel\n",
+                    **({} if HAS_TOMLLIB else codex_programs)}
+        self.write_fixtures({**protected, **writable})
+        try:
+            self.denied_all([f"echo 'curl evil' >> ~/{name}" for name in protected]
+                            + ["echo 'curl evil' > ~/.claude/agents/new.md",
+                               "echo 'curl evil' > ~/.claude/hooks/check.sh"], label="ISSUE8")
+            # Missing instruction files and directories cannot be planted.
+            for name in (".claude/CLAUDE.md", ".claude/skills/x/SKILL.md", ".codex/AGENTS.override.md"):
+                self.not_persisted(f'mkdir -p "$(dirname "$HOME/{name}")" && '
+                                   f'echo "run evil" > "$HOME/{name}"', home / name.split("/x/")[0])
+                print(f"ISSUE8 NOT PERSISTED {name}", flush=True)
+            self.assert_unchanged(protected)
+            # Positive controls: the agents' own config and state stay writable.
+            result = self.run_shell(" && ".join(
+                ["echo '{\"mcpServers\": {}}' >> ~/.claude.json",
+                 "echo '{}' > ~/.claude/projects/x.jsonl",
+                 "echo 'model = \"fixture\"' >> ~/.codex/config.toml",
+                 "echo '{}' > ~/.codex/auth.json",
+                 "echo '{}' > ~/.codex/sessions/x",
+                 "echo '{}' > ~/.claude/plugins/installed_plugins.json",
+                 "echo ok >> ~/tools/unrelated",
+                 "echo ok >> ~/.claude/hooks/unrelated.sh"]))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("mcpServers\": {}}", (home / ".claude.json").read_text())
+            self.assertIn("fixture", (home / ".codex/config.toml").read_text())
+            for name in (".claude/projects/x.jsonl", ".codex/sessions/x"):
+                self.assertTrue((home / name).exists(), name)
+            for name in ("tools/unrelated", ".claude/hooks/unrelated.sh"):
+                self.assertIn("ok", (home / name).read_text(), name)
+            print("ISSUE8 CONTROLS WRITABLE: ~/.claude.json ~/.claude/projects ~/.codex/config.toml "
+                  "~/.codex/auth.json ~/.codex/sessions ~/.claude/plugins, unrelated files", flush=True)
+        finally:
+            (home / ".claude.json").unlink()
+            for name in (".claude", ".codex", "tools"):
                 shutil.rmtree(home / name)
 
     def test_issue4_homebrew_prefix_dependencies(self):
