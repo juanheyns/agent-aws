@@ -100,7 +100,9 @@ Inside the sandbox:
   settings, and the git/SSH include targets, hooks directory and helper
   programs that this config names, user-level agent instructions such as
   `~/.claude/CLAUDE.md`, skills and `~/.codex/AGENTS.md`, and the hook and MCP
-  server programs that the agent config names) and install trees (PATH directories, the
+  server programs that the agent config names, and a short list of other
+  shells' and tools' startup code such as fish `config.fish` and `conf.d`,
+  `~/.oh-my-zsh/custom` and `~/.npmrc`) and install trees (PATH directories, the
   Python and AWS CLI installs, Homebrew prefixes). An `aws` that is a Python script (also a venv
   wrapper or a pip `/bin/sh` launcher) is followed to its interpreter; other
   `aws` wrappers, such as asdf/mise shims, are not

@@ -665,7 +665,8 @@ class Issue6ResolverTests(unittest.TestCase):
         self.assertIn(f"--bind {home}/Source/github.com/other {home}/Source/github.com/other", argv)
         note = error.getvalue()
         self.assertIn("agent-aws: Linux: new top-level entries in these directories are lost "
-                      "when the run ends (they hold protected git/ssh/agent config targets): ", note)
+                      "when the run ends (they hold protected git/ssh/agent config or "
+                      "$PYTHONSTARTUP targets): ", note)
         self.assertIn("~/Source, ~/Source/github.com, ~/Source/github.com/me, "
                       "~/Source/github.com/me/dotfiles, ~/work\n", note)
         # Skeletons that STARTUP_PATHS make anyway, and read-only
@@ -850,6 +851,108 @@ class Issue8AgentConfigTests(unittest.TestCase):
         self.assertNotIn(self.home, paths)
         self.assertFalse(paths & set(self.home.parents), paths & set(self.home.parents))
         self.assertNotIn(self.home / "notes.txt/sub", paths)
+
+
+class Issue9StartupCodeTests(unittest.TestCase):
+    """Shell and tool startup code (issue #9), scratch HOME only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name).resolve()
+        patcher = mock.patch.multiple(agent, HOME=self.home, AWS_DIR=self.home / ".aws",
+                                      AGENT_DIR=self.home / ".agent-aws")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    write = Issue6ResolverTests.write
+    assert_protected = Issue6ResolverTests.assert_protected
+
+    def test_issue9_startup_paths_and_tool_state_writable(self):
+        paths = {agent.HOME / path for path in agent.STARTUP_PATHS}
+        self.assert_protected(paths, ".config/fish/config.fish", ".config/fish/conf.d",
+                              ".config/fish/functions", ".config/fish/completions",
+                              ".oh-my-zsh/custom", ".zpreztorc", ".npmrc", ".inputrc",
+                              ".config/starship.toml", ".config/direnv", ".tmux.conf",
+                              ".config/tmux/tmux.conf", ".vimrc", ".vim/vimrc",
+                              ".config/vim/vimrc", ".config/nvim/init.lua",
+                              ".config/nvim/init.vim", ".ipython/profile_default/startup",
+                              ".ipython/profile_default/ipython_config.py")
+        for name in (".config", ".config/fish", ".config/fish/fish_variables", ".oh-my-zsh",
+                     ".oh-my-zsh/cache", ".zprezto", ".config/nvim", ".config/tmux", ".ipython",
+                     ".vim", ".config/vim", ".local/share/fish"):
+            self.assertNotIn(self.home / name, paths, name)
+        # LINUX_PARENT_BIND needs its protected entries as direct children.
+        for name in (".config/fish", ".oh-my-zsh"):
+            self.assertIn(name, agent.LINUX_PARENT_BIND)
+            below = [path for path in paths if agent.HOME / name in path.parents]
+            self.assertTrue(below, name)
+            self.assertTrue(all(path.parent == agent.HOME / name for path in below), name)
+
+    def test_issue9_python_startup_file(self):
+        startup = self.write("dotfiles/pythonrc.py", "# fixture\n")
+        for value, expected in ((str(startup), True), ("relative.py", False), ("", False)):
+            with mock.patch.dict(agent.os.environ, {"PYTHONSTARTUP": value}):
+                self.assertEqual(startup in agent.protected_paths(), expected, value)
+        # It is a config target: the Linux note lists ~/dotfiles, which is a
+        # skeleton only because of it.
+        with mock.patch.dict(agent.os.environ, {"PYTHONSTARTUP": str(startup)}):
+            targets = agent.config_targets()
+            self.assertIn(startup, targets)
+            protected = agent.protected_paths(targets)
+            self.assertEqual(agent.linux_target_skeletons(protected, targets),
+                             [self.home / "dotfiles"])
+
+    def test_issue9_linux_fish_and_omz_parent_bind(self):
+        for name in (".config/fish/config.fish", ".config/fish/fish_variables",
+                     ".config/fish/conf.d/x.fish", ".config/other/settings",
+                     ".oh-my-zsh/custom/x.zsh", ".oh-my-zsh/oh-my-zsh.sh", ".npmrc"):
+            self.write(name, "# fixture\n")
+        (self.home / ".oh-my-zsh/cache").mkdir()
+        (self.home / ".vim/plugin").mkdir(parents=True)
+        joined = " ".join(agent.build_sandbox_argv_linux(self.home / "creds")) + " "
+        # Review round 1: ~/.config/fish and ~/.oh-my-zsh are read-write binds
+        # (fish_variables and omz files can be replaced by rename); only the
+        # existing protected children are read-only on top. ~/.vim stays a
+        # skeleton, so a missing ~/.vim/vimrc cannot be created.
+        for name in (".config", ".vim"):
+            self.assertIn(f"--tmpfs {self.home}/{name} ", joined, name)
+        for name in (".config/fish", ".oh-my-zsh"):
+            self.assertNotIn(f"--tmpfs {self.home}/{name} ", joined, name)
+            self.assertIn(f"--bind {self.home}/{name} {self.home}/{name} ", joined, name)
+        for name in (".config/fish/config.fish", ".config/fish/conf.d", ".oh-my-zsh/custom", ".npmrc"):
+            self.assertIn(f"--ro-bind {self.home}/{name} {self.home}/{name} ", joined, name)
+            parent = str(Path(name).parent)
+            if parent != ".":
+                self.assertLess(joined.index(f"--bind {self.home}/{parent} "),
+                                joined.index(f"--ro-bind {self.home}/{name} "), name)
+        for name in (".config/fish/functions", ".config/fish/completions"):
+            self.assertNotIn(f"{self.home}/{name}", joined, name)
+        for name in (".config/fish/fish_variables", ".oh-my-zsh/oh-my-zsh.sh", ".oh-my-zsh/cache"):
+            self.assertNotIn(f"{self.home}/{name}", joined, name)
+        for name in (".config/other", ".vim/plugin"):
+            self.assertIn(f"--bind {self.home}/{name} {self.home}/{name} ", joined, name)
+        # Review round 2, R2-1: a symlinked protected child (absolute
+        # config.fish link, relative custom dir link into a dotfiles repo)
+        # keeps the skeleton for that directory only.
+        self.write("dotfiles/fish/config.fish", "# dotfiles\n")
+        self.write("dotfiles/omz-custom/x.zsh", "# dotfiles\n")
+        fish, omz = self.home / ".config/fish", self.home / ".oh-my-zsh"
+        (fish / "config.fish").unlink()
+        (fish / "config.fish").symlink_to(self.home / "dotfiles/fish/config.fish")
+        joined = " ".join(agent.build_sandbox_argv_linux(self.home / "creds")) + " "
+        self.assertIn(f"--tmpfs {fish} ", joined)
+        self.assertNotIn(f"--bind {fish} {fish} ", joined)
+        self.assertIn(f"--ro-bind {self.home}/dotfiles/fish/config.fish {fish}/config.fish ", joined)
+        self.assertIn(f"--bind {omz} {omz} ", joined)
+        shutil.rmtree(omz / "custom")
+        (omz / "custom").symlink_to("../dotfiles/omz-custom")
+        joined = " ".join(agent.build_sandbox_argv_linux(self.home / "creds")) + " "
+        self.assertIn(f"--tmpfs {omz} ", joined)
+        self.assertNotIn(f"--bind {omz} {omz} ", joined)
+        self.assertIn(f"--ro-bind {self.home}/dotfiles/omz-custom {omz}/custom ", joined)
+        # Skeleton: the existing oh-my-zsh.sh is a writable mount point.
+        self.assertIn(f"--bind {omz}/oh-my-zsh.sh {omz}/oh-my-zsh.sh ", joined)
 
 
 if __name__ == "__main__":
