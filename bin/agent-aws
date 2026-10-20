@@ -17,6 +17,7 @@ import configparser
 import errno
 import json
 import os
+import shlex
 import shutil
 import site
 import stat
@@ -60,6 +61,10 @@ PYTHON_PATHS_PROBE = (
     "sys.exec_prefix, sys.base_exec_prefix, site.getusersitepackages(), "
     "*site.getsitepackages(), *sysconfig.get_paths().values()]))"
 )
+PYTHON_NAMES = ("python", "pypy")
+# pip/distlib write `#!/bin/sh` and this line when the interpreter path is
+# longer than the kernel shebang limit or contains spaces.
+TRAMPOLINE = "'''exec' "
 INSTALL_DIR = SCRIPT_DIR.parent
 
 IS_MACOS = sys.platform == "darwin"
@@ -381,19 +386,92 @@ def resolve_aws_cli():
     return str(Path(path).resolve())
 
 
+def is_python_name(path):
+    return Path(path).name.startswith(PYTHON_NAMES)
+
+
+def env_command(words):
+    """Return (program, search path) for the arguments of an `env` shebang."""
+    search = executable_path()
+    words = list(words)
+    while words:
+        word = words.pop(0)
+        if word == "--":
+            break
+        if word.startswith("--"):
+            name, eq, value = word.partition("=")
+            if name in ("--unset", "--chdir") and not eq and words:
+                value = words.pop(0)
+            if name == "--unset" and value == "PATH" or name == "--ignore-environment":
+                search = os.defpath
+            elif name == "--split-string" and eq:
+                words[:0] = value.split()
+            continue
+        if word == "-":
+            search = os.defpath
+            continue
+        if word.startswith("-"):
+            # A cluster of short options; u, C and P take an argument and S
+            # starts the split command string (GNU and BSD env).
+            for index, option in enumerate(word[1:], 2):
+                if option == "i":
+                    search = os.defpath
+                elif option in "uCP":
+                    value = word[index:] or (words.pop(0) if words else "")
+                    if option == "u" and value == "PATH":
+                        search = os.defpath
+                    elif option == "P":
+                        search = value
+                    break
+                elif option == "S":
+                    words[:0] = word[index:].split()
+                    break
+            continue
+        if "=" in word:
+            name, _, value = word.partition("=")
+            if name == "PATH":
+                search = value
+            continue
+        return word, search
+    return (words[0] if words else None), search
+
+
 def script_python(path):
-    """Return the Python interpreter named by a script's shebang, or None."""
+    """Return the Python interpreter that runs a script, or None.
+
+    Follows a direct shebang, `env` (with its options), and the pip/distlib
+    `#!/bin/sh` + `'''exec' <python>` trampoline. Warns when a Python-like
+    interpreter is named but cannot be followed.
+    """
     try:
         with open(path, "rb") as f:
-            line = f.readline(512).decode(errors="replace")
+            first = f.readline(512).decode(errors="replace")
+            second = f.readline(4096).decode(errors="replace")
     except OSError:
         return None
-    words = line[2:].split() if line.startswith("#!") else []
+    if not first.startswith("#!"):
+        return None
+    words = first[2:].split()
+    python_like = any(name in first for name in PYTHON_NAMES)
     if words and Path(words[0]).name == "env":
-        words = [w for w in words[1:] if not w.startswith("-") and "=" not in w][:1]
-        words = [shutil.which(words[0], path=executable_path())] if words else []
-    if words and words[0] and Path(words[0]).name.startswith("python"):
+        command, search = env_command(words[1:])
+        if command:
+            python_like = is_python_name(command)
+            words = [(shutil.which(command, path=search) or "") if python_like else command]
+        else:
+            words = []
+    elif words and Path(words[0]).name == "sh" and second.startswith(TRAMPOLINE):
+        python_like = True
+        try:
+            words = shlex.split(second[len(TRAMPOLINE):])[:1]
+        except ValueError:
+            words = []
+    if words and words[0] and os.path.isabs(words[0]) and is_python_name(words[0]):
         return words[0]
+    if python_like:
+        print(f"agent-aws: warning: cannot follow the Python interpreter of the AWS CLI "
+              f"script {path} ({first.strip()}); its installation is not protected "
+              "(see https://github.com/juanheyns/agent-aws/issues/12)", file=sys.stderr)
     return None
 
 
@@ -408,6 +486,25 @@ def python_paths(python):
         return [Path(path) for path in json.loads(result.stdout) if path]
     except (OSError, subprocess.SubprocessError, TypeError, ValueError):
         die(f"cannot determine the Python paths of the AWS CLI interpreter {python}")
+
+
+def venv_paths(python):
+    """Protect a venv that the interpreter (lexical or resolved path) runs in.
+
+    Before Python 3.11, `-I -S` makes a venv interpreter report the base
+    install, because site.py sets sys.prefix to the venv. site.venv() looks
+    for pyvenv.cfg next to the executable or one level up, and uses the
+    executable's parent's parent as the venv prefix. The markers are always
+    protected so that a run cannot turn a directory into a venv.
+    """
+    paths = set()
+    for executable in (Path(python).absolute(), Path(python).resolve()):
+        root = executable.parent.parent
+        markers = (executable.parent / "pyvenv.cfg", root / "pyvenv.cfg")
+        paths.update(markers)
+        if any(marker.is_file() for marker in markers) and root != HOME and root not in HOME.parents:
+            paths.add(root)
+    return paths
 
 
 def protected_paths():
@@ -441,6 +538,7 @@ def protected_paths():
     python = aws and script_python(Path(aws).resolve())
     if python:
         paths.add(Path(python))
+        paths.update(venv_paths(python))
         paths.update(path for path in python_paths(python) if path.is_absolute()
                      and path != HOME and path not in HOME.parents)
     # Homebrew prefixes are user-writable. PATH symlinks, interpreters and the
@@ -449,12 +547,15 @@ def protected_paths():
     candidates = {parent for path in paths for parent in (path, *path.parents)}
     for prefix in sorted(candidates):
         if prefix != HOME and prefix not in HOME.parents and (prefix / "Cellar").is_dir():
-            paths.update(child for child in prefix.iterdir() if child.name != "var")
+            try:
+                paths.update(child for child in prefix.iterdir() if child.name != "var")
+            except OSError as exc:
+                die(f"cannot list the Homebrew prefix {prefix}: {exc}")
     return paths | {path.resolve() for path in paths}
 
 
-def build_sandbox_argv_darwin(creds_dir):
-    paths = protected_paths()
+def build_sandbox_argv_darwin(creds_dir, paths=None):
+    paths = protected_paths() if paths is None else paths
     ancestors = {parent for path in paths for parent in path.parents}
     # Literal ancestor denies stop rename-and-restore attacks without denying
     # writes to ordinary siblings. JSON quoting also escapes Scheme strings.
@@ -472,11 +573,11 @@ def build_sandbox_argv_darwin(creds_dir):
     ]
 
 
-def linux_home_mounts():
+def linux_home_mounts(protected=None):
     # Private skeletons prevent missing protected paths from being planted on
     # the host. Existing unprotected children (e.g. projects) remain writable.
     argv = []
-    protected = protected_paths()
+    protected = protected_paths() if protected is None else protected
     private = {AWS_DIR, AGENT_DIR}
     containers = {HOME}
     containers.update(parent for path in protected for parent in path.parents
@@ -513,7 +614,7 @@ def linux_home_mounts():
     return argv
 
 
-def build_sandbox_argv_linux(creds_dir):
+def build_sandbox_argv_linux(creds_dir, protected=None):
     return [
         "bwrap",
         "--ro-bind", "/usr", "/usr",
@@ -526,7 +627,7 @@ def build_sandbox_argv_linux(creds_dir):
         "--proc", "/proc",
         "--dev", "/dev",
         "--tmpfs", "/tmp",
-        *linux_home_mounts(),
+        *linux_home_mounts(protected),
         "--bind", str(creds_dir), str(creds_dir),
         "--ro-bind", str(INSTALL_DIR), str(INSTALL_DIR),
         "--die-with-parent",
@@ -538,11 +639,11 @@ def build_sandbox_argv_linux(creds_dir):
     ]
 
 
-def build_sandbox_argv(creds_dir):
+def build_sandbox_argv(creds_dir, protected=None):
     if IS_MACOS:
-        return build_sandbox_argv_darwin(creds_dir)
+        return build_sandbox_argv_darwin(creds_dir, protected)
     if IS_LINUX:
-        return build_sandbox_argv_linux(creds_dir)
+        return build_sandbox_argv_linux(creds_dir, protected)
     die(f"unsupported platform: {sys.platform}")
 
 
@@ -573,16 +674,41 @@ def cmd_run(args):
         active_default = cfg.get("default_profile") or next(iter(profiles))
 
     aws_cli = resolve_aws_cli()
+    AGENT_DIR.mkdir(mode=0o700, exist_ok=True)
+    # The interpreter probe can fail closed (die). Decide on the protected
+    # paths before any SSO token is read or handed to `aws`.
+    protected = protected_paths()
+
+    creds_dir = Path(tempfile.mkdtemp(prefix="agent-aws.", dir="/tmp"))
+    cred_file = creds_dir / "credentials"
+    cfg_file = creds_dir / "config"
+    # From here on, any exit (die, exception, Ctrl-C) removes the credentials.
+    try:
+        rc = run_with_credentials(args, active, active_default, aws_cli, protected,
+                                  creds_dir, cred_file, cfg_file)
+    finally:
+        for p in (cred_file, cfg_file):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            creds_dir.rmdir()
+        except OSError:
+            pass
+    sys.exit(rc)
+
+
+def run_with_credentials(args, active, active_default, aws_cli, protected,
+                         creds_dir, cred_file, cfg_file):
+    creds_dir.chmod(0o700)
+    sandbox_argv = build_sandbox_argv(creds_dir, protected)
+
     tokens = find_sso_tokens()
     needed = {p["sso_start_url"] for p in active.values()}
     missing = needed - set(tokens.keys())
     if missing:
         die(f"no valid SSO token for: {', '.join(sorted(missing))} — run `agent-aws login`")
-
-    creds_dir = Path(tempfile.mkdtemp(prefix="agent-aws.", dir="/tmp"))
-    creds_dir.chmod(0o700)
-    cred_file = creds_dir / "credentials"
-    cfg_file = creds_dir / "config"
 
     cred_lines, cfg_lines = [], []
     for name, p in active.items():
@@ -609,10 +735,6 @@ def cmd_run(args):
     cred_file.chmod(0o600)
     cfg_file.chmod(0o600)
 
-    AGENT_DIR.mkdir(mode=0o700, exist_ok=True)
-
-    sandbox_argv = build_sandbox_argv(creds_dir)
-
     env = {
         "HOME": str(HOME),
         "USER": os.environ.get("USER", ""),
@@ -633,19 +755,7 @@ def cmd_run(args):
         "AGENT_AWS_DEFAULT_PROFILE": active_default,
     }
 
-    try:
-        rc = subprocess.run(sandbox_argv + args.cmd, env=env).returncode
-    finally:
-        for p in (cred_file, cfg_file):
-            try:
-                p.unlink()
-            except FileNotFoundError:
-                pass
-        try:
-            creds_dir.rmdir()
-        except OSError:
-            pass
-    sys.exit(rc)
+    return subprocess.run(sandbox_argv + args.cmd, env=env).returncode
 
 
 def cmd_whoami(args):

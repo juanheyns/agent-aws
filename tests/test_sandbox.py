@@ -297,6 +297,110 @@ sys.exit(0 if rc == 0 else 1)
             pth.unlink(missing_ok=True)
             marker.unlink(missing_ok=True)
 
+    def test_round4_probe_failure_leaves_no_credentials_and_token_unused(self):
+        # Review round 1, finding 1: `python3` on PATH answers the `-I -S`
+        # probe with exit 1. The run must fail before `aws` gets the token,
+        # and leave no credentials in /tmp. The sandbox profile hides other
+        # runs by the fixed /tmp/agent-aws.* name, so agent-aws does not use
+        # TMPDIR; compare /tmp before and after instead.
+        wrap = self.home / "probe-fails/bin"
+        wrap.mkdir(parents=True)
+        calls = self.home / "project/aws-argv"
+        python3 = wrap / "python3"
+        python3.write_text('#!/bin/sh\ncase " $* " in *" -I -S "*) exit 1;; esac\n'
+                           f'exec {shlex.quote(sys.executable)} "$@"\n')
+        python3.chmod(0o700)
+        body = (self.home / "bin/aws").read_text().split("\n", 1)[1]
+        (wrap / "aws").write_text(
+            "#!/usr/bin/env python3\n"
+            f"import sys; open({str(calls)!r}, 'a').write(' '.join(sys.argv) + '\\n')\n" + body)
+        (wrap / "aws").chmod(0o700)
+        old_path = self.env["PATH"]
+        self.env["PATH"] = f"{wrap}:" + old_path
+        before = set(Path("/tmp").glob("agent-aws.*"))
+        try:
+            result = self.run_shell("true")
+            left = set(Path("/tmp").glob("agent-aws.*")) - before
+            print(f"PROBE FAIL: exit {result.returncode}; {result.stderr.strip()}; "
+                  f"aws argv recorded={calls.exists()}; left in /tmp={sorted(map(str, left))}",
+                  flush=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot determine the Python paths", result.stderr)
+            self.assertFalse(calls.exists() and "FAKE-NOT-A-TOKEN" in calls.read_text(),
+                             "aws received the SSO token before the probe failed")
+            self.assertEqual(sorted(left), [], "temp dir with credentials left in /tmp")
+        finally:
+            self.env["PATH"] = old_path
+            for leftover in set(Path("/tmp").glob("agent-aws.*")) - before:
+                shutil.rmtree(leftover, ignore_errors=True)  # fake credentials only
+            calls.unlink(missing_ok=True)
+            shutil.rmtree(self.home / "probe-fails")
+
+    @staticmethod
+    def python_up_to_3_10(env):
+        # macOS CLT /usr/bin/python3 is 3.9; CI runners keep older toolcache builds.
+        candidates = ["/usr/bin/python3", "/usr/local/bin/python3", sys.executable,
+                      *(shutil.which(f"python3.{minor}") for minor in (10, 9, 8))]
+        for root in ("/opt/hostedtoolcache", "/Users/runner/hostedtoolcache"):
+            for pattern in ("Python/3.10.*/*/bin/python3", "Python/3.9.*/*/bin/python3"):
+                candidates += sorted(map(str, Path(root).glob(pattern)))
+        for python in filter(None, candidates):
+            try:
+                probe = subprocess.run(
+                    [python, "-I", "-c", "import sys; print((3, 8) <= sys.version_info < (3, 11))"],
+                    env=env, capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if probe.returncode == 0 and probe.stdout.strip() == "True":
+                return python
+        return None
+
+    def test_round4_venv_wrapper_for_python_up_to_3_10(self):
+        # Review round 1, finding 2: before 3.11, `-I -S` hides a venv's
+        # prefix. `aws` is a wrapper outside the venv whose shebang names the
+        # venv's python (e.g. ~/bin/aws -> #!~/venvs/awscli/bin/python).
+        old = self.python_up_to_3_10(self.env)
+        if not old:
+            self.skipTest("requires a Python 3.8-3.10 interpreter (none found)")
+        venv = self.home / "venvs/awscli"
+        subprocess.run([old, "-I", "-m", "venv", "--without-pip", str(venv)],
+                       env=self.env, capture_output=True, text=True, check=True)
+        python = venv / "bin/python"
+        probe = subprocess.run([str(python), "-I", "-c", "import site; print(site.getsitepackages()[0])"],
+                               env=self.env, capture_output=True, text=True, check=True)
+        site_dir = Path(probe.stdout.strip())
+        self.assertIn(venv, site_dir.parents, "venv site-packages must stay inside scratch HOME")
+        aws = self.home / "bin/aws"
+        original = aws.read_text()
+        marker = self.home / "project/venv-pth-ran"
+        pth = site_dir / "zz-evil.pth"
+        payload = (f"import pathlib, sys; pathlib.Path({str(marker)!r}).write_text("
+                   "' '.join(sys.argv))\n")
+        aws.write_text(f"#!{python}\n" + original.split("\n", 1)[1])
+        try:
+            # Positive control: the venv interpreter executes its site .pth.
+            pth.write_text(payload)
+            subprocess.run([str(aws)], env=self.env, capture_output=True)
+            self.assertTrue(marker.exists())
+            pth.unlink()
+            marker.unlink()
+            # Run 1 cannot plant it; run 2 must not hand the token to it.
+            plant = self.run_shell(f"printf %s {shlex.quote(payload)} > {shlex.quote(str(pth))}")
+            print(f"VENV ({old}) run 1: exit {plant.returncode}; {plant.stderr.strip()}", flush=True)
+            next_run = self.run_shell('test "$AGENT_AWS_ACTIVE" = 1')
+            print(f"VENV run 2: exit {next_run.returncode}; payload saw: "
+                  f"{marker.read_text() if marker.exists() else '(did not run)'}", flush=True)
+            self.assertNotEqual(plant.returncode, 0, "run 1 planted a .pth in the venv")
+            self.assertRegex(plant.stderr.lower(), "not permitted|permission denied|read-only file system")
+            self.assertFalse(pth.exists())
+            self.assertEqual(next_run.returncode, 0, next_run.stderr)
+            self.assertFalse(marker.exists(), "venv interpreter ran planted startup code")
+        finally:
+            aws.write_text(original)
+            pth.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+            shutil.rmtree(venv)
+
     def test_review1_aws_path_poisoning_across_runs(self):
         # The candidate precedes the real fixture CLI and does not yet exist.
         candidate = self.home / ".local/bin/aws"
