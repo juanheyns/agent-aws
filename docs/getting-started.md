@@ -63,7 +63,10 @@ Inside the sandboxed process:
 - `aws ...` works with the default profile.
 - `aws --profile NAME ...` switches between configured accounts.
 - `~/.aws/` is empty / unreadable. The agent cannot mint admin credentials
-  even if it tries.
+  from inside the run, even if it tries.
+- Known startup paths are write-protected, but this is not full host
+  isolation. Review what a run leaves behind (see the
+  [supported host-isolation boundary](threat-model.md#supported-host-isolation-boundary)).
 
 ## What `agent-aws init` does
 

@@ -19,6 +19,10 @@ cause damage your team can't easily undo.
    credentials — is invisible to the sandboxed process.
 3. AWS-side IAM rejects any write actions even if the sandbox were bypassed.
 
+The sandbox also protects known startup paths against persistence. It is not
+full host isolation; the [threat model](threat-model.md#supported-host-isolation-boundary)
+lists what stays writable.
+
 ## Quick taste
 
 ```sh

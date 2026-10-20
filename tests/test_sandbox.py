@@ -188,6 +188,219 @@ sys.exit(0 if rc == 0 else 1)
         self.assertNotEqual(inside.returncode, 0)
         print(f"MACH LOOKUP: outside={outside.stdout.strip()}, inside={inside.stdout.strip()}", flush=True)
 
+    def not_persisted(self, command, path):
+        # Missing paths: EPERM on macOS; private to the run's skeleton on Linux.
+        result = self.run_shell(command)
+        if sys.platform == "darwin":
+            self.assertNotEqual(result.returncode, 0, command)
+        self.assertFalse(path.exists(), f"{path} persisted to host")
+
+    def test_issue4_git_ssh_and_agent_settings(self):
+        files = {".gitconfig": "[user]\n\tname = Fixture User\n", ".ssh/config": "# sentinel\n",
+                 ".ssh/authorized_keys": "# sentinel\n", ".ssh/known_hosts": "# sentinel\n",
+                 ".claude/settings.json": "{}\n"}
+        for name, text in files.items():
+            (self.home / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.home / name).write_text(text)
+        (self.home / ".claude/projects").mkdir()
+        try:
+            for command in (
+                "printf '[core]\\n\\tfsmonitor = /tmp/evil\\n' >> ~/.gitconfig",
+                "printf 'Host *\\n  ProxyCommand /tmp/evil\\n' >> ~/.ssh/config",
+                "echo 'ssh-ed25519 AAAA fixture' >> ~/.ssh/authorized_keys",
+                'echo \'{"hooks": {}}\' > ~/.claude/settings.json',
+            ):
+                self.denied(command)
+            for name in (".config/git/config", ".ssh/rc", ".claude/settings.local.json"):
+                self.not_persisted(f'mkdir -p "$(dirname "$HOME/{name}")" && '
+                                   f'echo /tmp/evil > "$HOME/{name}"', self.home / name)
+            for name, text in files.items():
+                self.assertEqual((self.home / name).read_text(), text, name)
+            # Reads and ordinary state still work: git reads its global config,
+            # ssh records host keys and Claude Code writes session state.
+            result = self.run_shell("git config --global --get user.name && "
+                                    "echo 'host ssh-ed25519 AAAA' >> ~/.ssh/known_hosts && "
+                                    "echo '{}' > ~/.claude/projects/session.jsonl")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Fixture User", result.stdout)
+            self.assertIn("host ssh-ed25519", (self.home / ".ssh/known_hosts").read_text())
+            self.assertTrue((self.home / ".claude/projects/session.jsonl").exists())
+        finally:
+            (self.home / ".gitconfig").unlink()
+            shutil.rmtree(self.home / ".ssh")
+            shutil.rmtree(self.home / ".claude")
+
+    def test_issue4_homebrew_prefix_dependencies(self):
+        # Scratch model of a user-owned Homebrew prefix: PATH holds symlinks
+        # into Cellar/, and interpreters load libraries through opt/.
+        prefix = self.home / "homebrew"
+        targets = ("Cellar/git/1.0/bin/git", "Cellar/xz/1.0/lib/liblzma.5.dylib",
+                   "lib/node_modules/pkg/cli.js")
+        for name in targets:
+            (prefix / name).parent.mkdir(parents=True, exist_ok=True)
+            (prefix / name).write_text("sentinel")
+        (prefix / "bin").mkdir()
+        (prefix / "bin/git").symlink_to("../Cellar/git/1.0/bin/git")
+        (prefix / "opt").mkdir()
+        (prefix / "opt/xz").symlink_to("../Cellar/xz/1.0")
+        (prefix / "var/db").mkdir(parents=True)
+        old_path = self.env["PATH"]
+        self.env["PATH"] = f"{prefix}/bin:" + old_path
+        try:
+            for name in targets:
+                self.denied(f'echo injected >> "{prefix}/{name}"')
+                self.assertEqual((prefix / name).read_text(), "sentinel")
+            self.denied(f'echo injected >> "{prefix}/opt/xz/lib/liblzma.5.dylib"')
+            # var/ holds service data (databases, logs) and stays writable.
+            result = self.run_shell(f'echo ok > "{prefix}/var/db/ok"')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((prefix / "var/db/ok").read_text(), "ok\n")
+        finally:
+            self.env["PATH"] = old_path
+            shutil.rmtree(prefix)
+
+    def test_issue4_aws_script_using_other_python(self):
+        # Round-3 note: `aws` may be a non-isolated script for another Python
+        # (e.g. `pip install --user awscli`) whose user site we do not use.
+        other = "/usr/bin/python3"
+        probe = subprocess.run([other, "-I", "-c", "import site, sys; "
+                                "print(tuple(sys.version_info[:2]), site.getusersitepackages())"],
+                               env=self.env, capture_output=True, text=True) \
+            if os.path.exists(other) else None
+        if not probe or probe.returncode or probe.stdout.startswith(str(tuple(sys.version_info[:2]))):
+            self.skipTest("requires a second Python version at /usr/bin/python3")
+        user_site = Path(probe.stdout.split(") ", 1)[1].strip())
+        self.assertIn(self.home, user_site.parents, "user site must stay inside scratch HOME")
+        user_site.mkdir(parents=True, exist_ok=True)  # as `pip install --user` leaves it
+        aws = self.home / "bin/aws"
+        original = aws.read_text()
+        marker = self.home / "project/aws-pth-ran"
+        pth = user_site / "zz-agent-aws-test.pth"
+        payload = (f"import pathlib, sys; pathlib.Path({str(marker)!r}).write_text("
+                   "' '.join(sys.argv))\n")
+        aws.write_text(f"#!{other}\n" + original.split("\n", 1)[1])
+        try:
+            # Positive control: that interpreter executes its user-site .pth.
+            pth.write_text(payload)
+            subprocess.run([str(aws)], env=self.env, capture_output=True)
+            self.assertTrue(marker.exists())
+            pth.unlink()
+            marker.unlink()
+            # Run 1 cannot plant it; run 2 must not hand the token to it.
+            self.denied(f"printf %s {shlex.quote(payload)} > {shlex.quote(str(pth))}")
+            self.assertFalse(pth.exists())
+            next_run = self.run_shell('test "$AGENT_AWS_ACTIVE" = 1')
+            self.assertEqual(next_run.returncode, 0, next_run.stderr)
+            self.assertFalse(marker.exists(), "AWS CLI interpreter ran planted startup code")
+        finally:
+            aws.write_text(original)
+            pth.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+
+    def test_round4_probe_failure_leaves_no_credentials_and_token_unused(self):
+        # Review round 1, finding 1: `python3` on PATH answers the `-I -S`
+        # probe with exit 1. The run must fail before `aws` gets the token,
+        # and leave no credentials in /tmp. The sandbox profile hides other
+        # runs by the fixed /tmp/agent-aws.* name, so agent-aws does not use
+        # TMPDIR; compare /tmp before and after instead.
+        wrap = self.home / "probe-fails/bin"
+        wrap.mkdir(parents=True)
+        calls = self.home / "project/aws-argv"
+        python3 = wrap / "python3"
+        python3.write_text('#!/bin/sh\ncase " $* " in *" -I -S "*) exit 1;; esac\n'
+                           f'exec {shlex.quote(sys.executable)} "$@"\n')
+        python3.chmod(0o700)
+        body = (self.home / "bin/aws").read_text().split("\n", 1)[1]
+        (wrap / "aws").write_text(
+            "#!/usr/bin/env python3\n"
+            f"import sys; open({str(calls)!r}, 'a').write(' '.join(sys.argv) + '\\n')\n" + body)
+        (wrap / "aws").chmod(0o700)
+        old_path = self.env["PATH"]
+        self.env["PATH"] = f"{wrap}:" + old_path
+        before = set(Path("/tmp").glob("agent-aws.*"))
+        try:
+            result = self.run_shell("true")
+            left = set(Path("/tmp").glob("agent-aws.*")) - before
+            print(f"PROBE FAIL: exit {result.returncode}; {result.stderr.strip()}; "
+                  f"aws argv recorded={calls.exists()}; left in /tmp={sorted(map(str, left))}",
+                  flush=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot determine the Python paths", result.stderr)
+            self.assertFalse(calls.exists() and "FAKE-NOT-A-TOKEN" in calls.read_text(),
+                             "aws received the SSO token before the probe failed")
+            self.assertEqual(sorted(left), [], "temp dir with credentials left in /tmp")
+        finally:
+            self.env["PATH"] = old_path
+            for leftover in set(Path("/tmp").glob("agent-aws.*")) - before:
+                shutil.rmtree(leftover, ignore_errors=True)  # fake credentials only
+            calls.unlink(missing_ok=True)
+            shutil.rmtree(self.home / "probe-fails")
+
+    @staticmethod
+    def python_up_to_3_10(env):
+        # macOS CLT /usr/bin/python3 is 3.9; CI runners keep older toolcache builds.
+        candidates = ["/usr/bin/python3", "/usr/local/bin/python3", sys.executable,
+                      *(shutil.which(f"python3.{minor}") for minor in (10, 9, 8))]
+        for root in ("/opt/hostedtoolcache", "/Users/runner/hostedtoolcache"):
+            for pattern in ("Python/3.10.*/*/bin/python3", "Python/3.9.*/*/bin/python3"):
+                candidates += sorted(map(str, Path(root).glob(pattern)))
+        for python in filter(None, candidates):
+            try:
+                probe = subprocess.run(
+                    [python, "-I", "-c", "import sys; print((3, 8) <= sys.version_info < (3, 11))"],
+                    env=env, capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if probe.returncode == 0 and probe.stdout.strip() == "True":
+                return python
+        return None
+
+    def test_round4_venv_wrapper_for_python_up_to_3_10(self):
+        # Review round 1, finding 2: before 3.11, `-I -S` hides a venv's
+        # prefix. `aws` is a wrapper outside the venv whose shebang names the
+        # venv's python (e.g. ~/bin/aws -> #!~/venvs/awscli/bin/python).
+        old = self.python_up_to_3_10(self.env)
+        if not old:
+            self.skipTest("requires a Python 3.8-3.10 interpreter (none found)")
+        venv = self.home / "venvs/awscli"
+        subprocess.run([old, "-I", "-m", "venv", "--without-pip", str(venv)],
+                       env=self.env, capture_output=True, text=True, check=True)
+        python = venv / "bin/python"
+        probe = subprocess.run([str(python), "-I", "-c", "import site; print(site.getsitepackages()[0])"],
+                               env=self.env, capture_output=True, text=True, check=True)
+        site_dir = Path(probe.stdout.strip())
+        self.assertIn(venv, site_dir.parents, "venv site-packages must stay inside scratch HOME")
+        aws = self.home / "bin/aws"
+        original = aws.read_text()
+        marker = self.home / "project/venv-pth-ran"
+        pth = site_dir / "zz-evil.pth"
+        payload = (f"import pathlib, sys; pathlib.Path({str(marker)!r}).write_text("
+                   "' '.join(sys.argv))\n")
+        aws.write_text(f"#!{python}\n" + original.split("\n", 1)[1])
+        try:
+            # Positive control: the venv interpreter executes its site .pth.
+            pth.write_text(payload)
+            subprocess.run([str(aws)], env=self.env, capture_output=True)
+            self.assertTrue(marker.exists())
+            pth.unlink()
+            marker.unlink()
+            # Run 1 cannot plant it; run 2 must not hand the token to it.
+            plant = self.run_shell(f"printf %s {shlex.quote(payload)} > {shlex.quote(str(pth))}")
+            print(f"VENV ({old}) run 1: exit {plant.returncode}; {plant.stderr.strip()}", flush=True)
+            next_run = self.run_shell('test "$AGENT_AWS_ACTIVE" = 1')
+            print(f"VENV run 2: exit {next_run.returncode}; payload saw: "
+                  f"{marker.read_text() if marker.exists() else '(did not run)'}", flush=True)
+            self.assertNotEqual(plant.returncode, 0, "run 1 planted a .pth in the venv")
+            self.assertRegex(plant.stderr.lower(), "not permitted|permission denied|read-only file system")
+            self.assertFalse(pth.exists())
+            self.assertEqual(next_run.returncode, 0, next_run.stderr)
+            self.assertFalse(marker.exists(), "venv interpreter ran planted startup code")
+        finally:
+            aws.write_text(original)
+            pth.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+            shutil.rmtree(venv)
+
     def test_review1_aws_path_poisoning_across_runs(self):
         # The candidate precedes the real fixture CLI and does not yet exist.
         candidate = self.home / ".local/bin/aws"
